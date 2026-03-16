@@ -126,10 +126,10 @@ class OptimizerTraceCollector:
             """
             
             # 시작 시간 마커 생성
-            self.ssh_client.execute_command(f"touch /tmp/trace_start_time")
+            self.ssh_client.run_remote_cmd(f"touch /tmp/trace_start_time")
             
             # 트레이스 파일 찾기
-            trace_files = self.ssh_client.execute_command(find_cmd).strip().split('\n')
+            trace_files = self.ssh_client.run_remote_cmd(find_cmd).strip().split('\n')
             trace_files = [f for f in trace_files if f.strip()]
             
             if not trace_files:
@@ -231,166 +231,212 @@ class OptimizerTraceAnalyzer:
                 parsed_data['optimizer_parameters'][param_name] = param_value
     
     def _extract_base_statistics(self, content: str, parsed_data: Dict[str, Any]):
-        """기본 통계 정보 추출"""
-        # BASE STATISTICAL INFORMATION 섹션 찾기
-        stats_pattern = r'BASE STATISTICAL INFORMATION(.*?)(?=\n\n|\n\*\*\*|\nTABLE)'
-        stats_match = re.search(stats_pattern, content, re.DOTALL)
-        
-        if stats_match:
-            stats_text = stats_match.group(1)
-            
-            # 테이블 통계 추출
-            table_stats_pattern = r'Table Stats::\s*Table:\s*(\w+)\s+Alias:\s*(\w+)\s*#Rows:\s*(\d+)\s+#Blks:\s*(\d+)\s+AvgRowLen:\s*(\d+)'
-            
-            for match in re.finditer(table_stats_pattern, stats_text):
-                table_name = match.group(1)
-                alias = match.group(2)
-                rows = int(match.group(3))
-                blocks = int(match.group(4))
-                avg_row_len = int(match.group(5))
-                
-                parsed_data['base_statistics'][table_name] = {
-                    'alias': alias,
-                    'rows': rows,
-                    'blocks': blocks,
-                    'avg_row_len': avg_row_len
-                }
-    
+        """기본 통계 정보 추출 — 실제 10053 포맷에 맞춤"""
+        # Table Stats 추출
+        # 실제 형식: Table: TB_FINANCIAL_STMT  Alias: TB_FINANCIAL_STMT  (Using composite stats)
+        #   #Rows: 3802835  SSZ: 0  LGR: 0  #Blks:  112876  AvgRowLen:  202.00
+        table_pattern = re.compile(
+            r'Table:\s+(\S+)\s+Alias:\s+(\S+).*?\n'
+            r'\s+#Rows:\s+(\d+).*?#Blks:\s+(\d+)\s+AvgRowLen:\s+([\d.]+)',
+            re.DOTALL
+        )
+        for m in table_pattern.finditer(content):
+            table_name = m.group(1)
+            parsed_data['base_statistics'][table_name] = {
+                'alias': m.group(2),
+                'rows': int(m.group(3)),
+                'blocks': int(m.group(4)),
+                'avg_row_len': float(m.group(5))
+            }
+
+        # Index Stats 추출
+        # 실제 형식: Index: IDX_FS_CORP_YEAR  Col#: 2 4 5
+        #   LVLS: 2  #LB: 19266  #DK: 18994  LB/K: 1.00  DB/K: 7.00  CLUF: 141132.00  NRW: 3802835.00
+        index_pattern = re.compile(
+            r'Index:\s+(\S+)\s+Col#:\s+([\d\s]+)\n'
+            r'.*?LVLS:\s+(\d+)\s+#LB:\s+(\d+)\s+#DK:\s+(\d+)\s+LB/K:\s+([\d.]+)\s+DB/K:\s+([\d.]+)\s+CLUF:\s+([\d.]+)\s+NRW:\s+([\d.]+)',
+            re.DOTALL
+        )
+        indexes = {}
+        for m in index_pattern.finditer(content):
+            idx_name = m.group(1)
+            indexes[idx_name] = {
+                'columns': m.group(2).strip(),
+                'levels': int(m.group(3)),
+                'leaf_blocks': int(m.group(4)),
+                'distinct_keys': int(m.group(5)),
+                'lb_per_key': float(m.group(6)),
+                'db_per_key': float(m.group(7)),
+                'clustering_factor': float(m.group(8)),
+                'num_rows': float(m.group(9))
+            }
+        parsed_data['index_statistics'] = indexes
+
+        # Column 통계 추출
+        # 실제 형식: Column (#5): REPRT_CODE(VARCHAR2)
+        #   AvgLen: 6 NDV: 4 Nulls: 0 Density: 0.115587
+        #   Histogram: Freq  #Bkts: 4
+        col_pattern = re.compile(
+            r'Column\s+\(#\d+\):\s+(\S+)\((\w+)\)\n'
+            r'\s+AvgLen:\s+(\d+)\s+NDV:\s+(\d+)\s+Nulls:\s+(\d+)\s+Density:\s+([\d.]+)\n'
+            r'\s+Histogram:\s+(\S+)\s+#Bkts:\s+(\d+)',
+        )
+        columns = {}
+        for m in col_pattern.finditer(content):
+            col_name = m.group(1)
+            columns[col_name] = {
+                'data_type': m.group(2),
+                'avg_len': int(m.group(3)),
+                'ndv': int(m.group(4)),
+                'nulls': int(m.group(5)),
+                'density': float(m.group(6)),
+                'histogram': m.group(7),
+                'buckets': int(m.group(8))
+            }
+        parsed_data['column_statistics'] = columns
+
     def _extract_table_access_paths(self, content: str, parsed_data: Dict[str, Any]):
-        """테이블 접근 경로 분석"""
-        # SINGLE TABLE ACCESS PATH 섹션들 찾기
-        access_path_pattern = r'SINGLE TABLE ACCESS PATH(.*?)(?=\n\n|\nSINGLE TABLE ACCESS PATH|\nJOIN ORDER)'
+        """테이블 접근 경로 분석 — 실제 10053 포맷에 맞춤"""
+        # Access path analysis for TABLE_NAME 블록 찾기
+        access_blocks = re.split(r'Access path analysis for (\S+)', content)
         
-        for match in re.finditer(access_path_pattern, content, re.DOTALL):
-            path_text = match.group(1)
-            
-            # 테이블명 추출
-            table_match = re.search(r'Table:\s*(\w+)', path_text)
-            if not table_match:
-                continue
-                
-            table_name = table_match.group(1)
+        for i in range(1, len(access_blocks), 2):
+            table_name = access_blocks[i]
+            block_text = access_blocks[i+1] if i+1 < len(access_blocks) else ""
+            # 다음 Access path analysis 전까지만
+            block_text = block_text.split('Access path analysis for')[0]
             
             path_info = {
                 'table_name': table_name,
-                'access_methods': []
+                'cardinality': None,
+                'access_methods': [],
+                'best_access': None
             }
             
-            # 각 접근 방법의 비용 추출
-            cost_pattern = r'(\w+(?:\s+\w+)*)\s+Cost:\s*(\d+)\s+Resp:\s*(\d+)\s+Degree:\s*(\d+)'
+            # Cardinality 추출
+            card_m = re.search(r'Card: Original:\s+([\d.]+)\s+Rounded:\s+(\d+)', block_text)
+            if card_m:
+                path_info['cardinality'] = int(card_m.group(2))
             
-            for cost_match in re.finditer(cost_pattern, path_text):
-                access_method = cost_match.group(1).strip()
-                cost = int(cost_match.group(2))
-                response_time = int(cost_match.group(3))
-                degree = int(cost_match.group(4))
+            # Access Path: TableScan / index (FFS) / index (FullScan) 등
+            # 실제 형식: Access Path: TableScan
+            #   Cost:  18882.019786  Resp: 18882.019786  Degree: 0
+            ap_pattern = re.compile(
+                r'Access Path:\s+(.+?)\n'
+                r'(?:.*?Index:\s+(\S+)\n)?'  # 인덱스명 (있으면)
+                r'.*?Cost:\s+([\d.]+)\s+Resp:\s+([\d.]+)\s+Degree:\s+(\d+)',
+                re.DOTALL
+            )
+            for m in ap_pattern.finditer(block_text):
+                method = m.group(1).strip()
+                index_name = m.group(2) if m.group(2) else None
+                cost = float(m.group(3))
+                resp = float(m.group(4))
+                degree = int(m.group(5))
                 
                 path_info['access_methods'].append({
-                    'method': access_method,
+                    'method': method,
+                    'index': index_name,
                     'cost': cost,
-                    'response_time': response_time,
+                    'response_time': resp,
                     'degree': degree
                 })
             
+            # Best Access Path 추출
+            # 실제: Best:: AccessPath: IndexFFS
+            #   Index: IDX_FS_CORP_YEAR
+            #   Cost: 3232.919726  Degree: 1  Resp: 3232.919726  Card: 3802835.000000
+            best_m = re.search(
+                r'Best::\s+AccessPath:\s+(\S+).*?'
+                r'(?:Index:\s+(\S+))?.*?'
+                r'Cost:\s+([\d.]+).*?Card:\s+([\d.]+)',
+                block_text, re.DOTALL
+            )
+            if best_m:
+                path_info['best_access'] = {
+                    'method': best_m.group(1),
+                    'index': best_m.group(2),
+                    'cost': float(best_m.group(3)),
+                    'cardinality': float(best_m.group(4))
+                }
+            
             parsed_data['table_access_paths'].append(path_info)
-    
+
     def _extract_join_orders(self, content: str, parsed_data: Dict[str, Any]):
-        """조인 순서 분석"""
-        # JOIN ORDER 섹션 찾기
-        join_order_pattern = r'JOIN ORDER\[(\d+)\]:(.*?)(?=\nJOIN ORDER|\nBEST JOIN ORDER|\n\*\*\*)'
-        
-        for match in re.finditer(join_order_pattern, content, re.DOTALL):
-            order_num = int(match.group(1))
-            order_text = match.group(2)
-            
-            # 조인 순서와 비용 추출
-            cost_match = re.search(r'Cost:\s*(\d+)', order_text)
-            cost = int(cost_match.group(1)) if cost_match else 0
-            
-            # 테이블 순서 추출
-            table_order = []
-            table_pattern = r'(\w+)\s*\[\d+\]'
-            for table_match in re.finditer(table_pattern, order_text):
-                table_order.append(table_match.group(1))
-            
+        """조인 순서 분석 — 실제 10053 포맷에 맞춤"""
+        # Join order[N]: TABLE1[ALIAS]#0 TABLE2[ALIAS]#1
+        join_pattern = re.compile(
+            r'Join order\[(\d+)\]:\s+(.+?)$',
+            re.MULTILINE | re.IGNORECASE
+        )
+        for m in join_pattern.finditer(content):
+            order_num = int(m.group(1))
+            order_text = m.group(2).strip()
+            # 테이블 추출: TABLE_NAME[ALIAS]#N
+            tables = re.findall(r'(\w+)\[', order_text)
             parsed_data['join_orders'].append({
                 'order_num': order_num,
-                'tables': table_order,
-                'cost': cost,
-                'details': order_text.strip()
+                'tables': tables,
+                'raw': order_text
             })
         
-        # BEST JOIN ORDER 추출
-        best_join_pattern = r'BEST JOIN ORDER:(.*?)(?=\n\n|\n\*\*\*)'
-        best_match = re.search(best_join_pattern, content, re.DOTALL)
+        # Best so far: Table#: 0  cost: 3435.821485  card: 3802835.000000  bytes: 22817010.000000
+        best_pattern = re.compile(
+            r'Best so far:\s+Table#:\s+\d+\s+cost:\s+([\d.]+)\s+card:\s+([\d.]+)\s+bytes:\s+([\d.]+)'
+        )
+        best_costs = []
+        for m in best_pattern.finditer(content):
+            best_costs.append({
+                'cost': float(m.group(1)),
+                'cardinality': float(m.group(2)),
+                'bytes': float(m.group(3))
+            })
+        if best_costs:
+            parsed_data['best_join_order'] = best_costs[-1]  # 마지막이 최종
         
-        if best_match:
-            best_text = best_match.group(1)
-            cost_match = re.search(r'Cost:\s*(\d+)', best_text)
-            cost = int(cost_match.group(1)) if cost_match else 0
-            
-            parsed_data['best_join_order'] = {
-                'cost': cost,
-                'details': best_text.strip()
-            }
-    
+        # Number of join permutations tried
+        perm_m = re.search(r'Number of join permutations tried:\s+(\d+)', content)
+        if perm_m:
+            parsed_data['join_permutations_tried'] = int(perm_m.group(1))
+
     def _analyze_costs(self, parsed_data: Dict[str, Any]):
-        """비용 분석"""
-        join_orders = parsed_data['join_orders']
-        
-        if len(join_orders) >= 2:
-            # 비용 순으로 정렬
-            sorted_orders = sorted(join_orders, key=lambda x: x['cost'])
-            
-            best_cost = sorted_orders[0]['cost']
-            second_best_cost = sorted_orders[1]['cost'] if len(sorted_orders) > 1 else best_cost
-            
-            cost_diff_threshold = self.optimizer_config.get('analysis_rules', {}).get('cost_diff_threshold', 20)
-            
-            parsed_data['cost_analysis'] = {
-                'best_cost': best_cost,
-                'second_best_cost': second_best_cost,
-                'cost_difference_pct': ((second_best_cost - best_cost) / best_cost * 100) if best_cost > 0 else 0,
-                'significant_difference': ((second_best_cost - best_cost) / best_cost * 100) > cost_diff_threshold if best_cost > 0 else False
-            }
-    
+        """비용 분석 — 접근 경로별 비용 비교"""
+        for path in parsed_data.get('table_access_paths', []):
+            methods = path.get('access_methods', [])
+            if methods:
+                methods_sorted = sorted(methods, key=lambda x: x.get('cost', 0))
+                path['cheapest'] = methods_sorted[0]
+                path['most_expensive'] = methods_sorted[-1]
+                if len(methods_sorted) > 1:
+                    path['cost_ratio'] = methods_sorted[-1]['cost'] / methods_sorted[0]['cost']
+
     def _detect_issues(self, parsed_data: Dict[str, Any]):
-        """이슈 자동 감지"""
-        issues = []
-        analysis_rules = self.optimizer_config.get('analysis_rules', {})
+        """이슈 감지 — 실무 관점"""
+        issues = parsed_data.get('issues', [])
+        rules = self.optimizer_config.get('analysis_rules', {})
         
-        # 1. 통계 정보 부정확성 체크
-        stale_stats_days = analysis_rules.get('stale_stats_days', 30)
+        # 1. Full Table Scan이 최적인 경우 경고
+        for path in parsed_data.get('table_access_paths', []):
+            best = path.get('best_access', {})
+            if best and best.get('method') == 'TableScan':
+                rows = parsed_data.get('base_statistics', {}).get(path['table_name'], {}).get('rows', 0)
+                if rows > 100000:
+                    issues.append(f"⚠️ {path['table_name']}: Full Table Scan이 최적 ({rows:,}행) — 인덱스 검토 필요")
         
-        # 2. 카디널리티 추정 오차 체크 (실제 구현 시 V$SQL_PLAN_STATISTICS와 비교)
-        cardinality_threshold = analysis_rules.get('cardinality_error_threshold', 10)
+        # 2. 인덱스 클러스터링 팩터 높은 경우
+        for idx_name, idx_info in parsed_data.get('index_statistics', {}).items():
+            cf = idx_info.get('clustering_factor', 0)
+            rows = idx_info.get('num_rows', 0)
+            if rows > 0 and cf / rows > 0.5:
+                issues.append(f"⚠️ {idx_name}: Clustering Factor 높음 ({cf:,.0f}/{rows:,.0f} = {cf/rows:.1%}) — 테이블 재구성 고려")
         
-        # 3. 비용 차이 분석
-        cost_analysis = parsed_data.get('cost_analysis', {})
-        if cost_analysis.get('significant_difference', False):
-            issues.append({
-                'type': 'COST_DIFFERENCE',
-                'severity': 'WARNING',
-                'message': f"조인 순서별 비용 차이가 큼 ({cost_analysis.get('cost_difference_pct', 0):.1f}%)",
-                'recommendation': "통계 정보 갱신 또는 힌트 사용 검토"
-            })
-        
-        # 4. 테이블 접근 방법 분석
-        for table_access in parsed_data['table_access_paths']:
-            access_methods = table_access['access_methods']
-            if access_methods:
-                # Full Table Scan이 가장 효율적인 경우 체크
-                best_method = min(access_methods, key=lambda x: x['cost'])
-                if 'FULL' in best_method['method'].upper():
-                    issues.append({
-                        'type': 'FULL_TABLE_SCAN',
-                        'severity': 'INFO',
-                        'message': f"테이블 {table_access['table_name']}에 Full Table Scan이 최적으로 선택됨",
-                        'recommendation': "데이터량 대비 인덱스 효율성 검토"
-                    })
+        # 3. 카디널리티 추정 이슈 (NDV가 매우 적은 컬럼으로 필터)
+        for col_name, col_info in parsed_data.get('column_statistics', {}).items():
+            if col_info.get('ndv', 0) <= 5 and col_info.get('histogram') != 'Freq':
+                issues.append(f"💡 {col_name}: NDV={col_info['ndv']}로 적음 — Frequency Histogram 확인")
         
         parsed_data['issues'] = issues
-    
+
     def generate_10053_report(self, parsed_data: Dict[str, Any], output_path: str) -> str:
         """HTML 리포트 생성"""
         self.logger.info(f"10053 리포트 생성: {output_path}")
@@ -502,13 +548,13 @@ class OptimizerTraceAnalyzer:
                         <tr><th>접근 방법</th><th>비용</th><th>응답 시간</th><th>병렬도</th></tr>
                     """
                     # 비용 순으로 정렬하여 최적 방법 강조
-                    sorted_methods = sorted(table_access['access_methods'], key=lambda x: x['cost'])
+                    sorted_methods = sorted(table_access['access_methods'], key=lambda x: x.get('cost', 0))
                     for i, method in enumerate(sorted_methods):
                         css_class = 'cost-highlight' if i == 0 else ''
                         html += f"""
                         <tr class="{css_class}">
                             <td>{method['method']}</td>
-                            <td>{method['cost']}</td>
+                            <td>{method.get('cost', 0)}</td>
                             <td>{method['response_time']}</td>
                             <td>{method['degree']}</td>
                         </tr>
@@ -525,7 +571,7 @@ class OptimizerTraceAnalyzer:
                     <tr><th>순서</th><th>테이블 순서</th><th>비용</th></tr>
             """
             # 비용 순으로 정렬
-            sorted_orders = sorted(parsed_data['join_orders'], key=lambda x: x['cost'])
+            sorted_orders = sorted(parsed_data['join_orders'], key=lambda x: x.get('cost', 0))
             for i, order in enumerate(sorted_orders):
                 css_class = 'cost-highlight' if i == 0 else ''
                 tables_str = ' → '.join(order['tables']) if order['tables'] else 'N/A'
@@ -533,7 +579,7 @@ class OptimizerTraceAnalyzer:
                 <tr class="{css_class}">
                     <td>{order['order_num']}</td>
                     <td>{tables_str}</td>
-                    <td>{order['cost']:,}</td>
+                    <td>{order.get('cost', 0):,}</td>
                 </tr>
                 """
             html += "</table>"
@@ -542,8 +588,8 @@ class OptimizerTraceAnalyzer:
             if parsed_data['best_join_order']:
                 html += f"""
                 <h3>✅ 최종 선택된 조인 순서</h3>
-                <p><strong>비용:</strong> {parsed_data['best_join_order']['cost']:,}</p>
-                <pre>{parsed_data['best_join_order']['details']}</pre>
+                <p><strong>비용:</strong> {parsed_data['best_join_order'].get('cost', 0):,}</p>
+                <pre>{parsed_data['best_join_order'].get('details', parsed_data['best_join_order'].get('raw', 'N/A'))}</pre>
                 """
             
             html += "</div>"
