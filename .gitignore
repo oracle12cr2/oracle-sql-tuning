@@ -1,69 +1,13 @@
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Virtual environments
-venv/
-env/
-ENV/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Output directories
-output/
-logs/
-*.log
-
-# Oracle trace files
-*.trc
-*.trm
-
-# Credentials
-config/credentials.yaml
-config/secrets.yaml
-*.key
-*.pem
-
-# Temporary files
-temp/
-tmp/
+*.pyc
+~$*
+logs/*.log
+data/*.sqlite
+output/reports/*.xlsx
+output/reports/*.html
+output/reports/10053/
+output/reports/20*/
+output/traces/*.trc
+output/traces/*.json
+output/tkprof/*.prf
 *.tmp
-
-# Excel files (output)
-*.xlsx
-*.xls
-
-# HTML reports (output)
-reports/
-*.html
-
-# OS specific
-.DS_Store
-Thumbs.db
-
-# Backup files
-*.bak
-*.backup
