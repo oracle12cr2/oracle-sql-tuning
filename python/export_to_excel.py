@@ -354,8 +354,12 @@ def query_db_info(config_data):
 
 
 
-def query_display_cursor(config_data, sql_ids):
-    """DBMS_XPLAN.DISPLAY_CURSOR로 실행계획 조회"""
+def query_display_cursor(config_data, sql_ids=None):
+    """DBMS_XPLAN.DISPLAY_CURSOR로 실행계획 조회
+    - SYS, SYSTEM 제외
+    - LOCKED 계정 제외
+    - 일반 OPEN 계정의 SQL만 대상
+    """
     results = {}
     try:
         import sys
@@ -365,6 +369,47 @@ def query_display_cursor(config_data, sql_ids):
         config = load_config()
         conn = get_oracle_connection(config)
         cursor = conn.cursor()
+
+        # LOCKED 계정 + SYS/SYSTEM 목록 조회
+        cursor.execute("""
+            SELECT USERNAME FROM DBA_USERS
+            WHERE ACCOUNT_STATUS LIKE '%LOCKED%'
+               OR USERNAME IN ('SYS', 'SYSTEM', 'DBSNMP', 'OUTLN', 'AUDSYS')
+        """)
+        exclude_users = set(r[0] for r in cursor)
+        print(f"  XPLAN exclude users: {len(exclude_users)} accounts (SYS/SYSTEM/LOCKED)")
+
+        # sql_ids가 없으면 V$SQL에서 일반 계정 Top SQL 조회
+        if not sql_ids:
+            cursor.execute("""
+                SELECT DISTINCT SQL_ID
+                FROM V$SQL
+                WHERE PARSING_SCHEMA_NAME NOT IN (
+                    SELECT USERNAME FROM DBA_USERS
+                    WHERE ACCOUNT_STATUS LIKE '%LOCKED%'
+                       OR USERNAME IN ('SYS', 'SYSTEM', 'DBSNMP', 'OUTLN', 'AUDSYS')
+                )
+                AND ELAPSED_TIME > 0
+                ORDER BY ELAPSED_TIME DESC
+                FETCH FIRST 20 ROWS ONLY
+            """)
+            sql_ids = [r[0] for r in cursor]
+            print(f"  XPLAN target: {len(sql_ids)} SQL IDs from V$SQL (normal users)")
+        else:
+            # 전달된 sql_ids 중에서도 일반 계정 것만 필터
+            placeholders = ','.join([f':s{i}' for i in range(len(sql_ids))])
+            bind = {f's{i}': sid for i, sid in enumerate(sql_ids)}
+            cursor.execute(f"""
+                SELECT DISTINCT SQL_ID FROM V$SQL
+                WHERE SQL_ID IN ({placeholders})
+                AND PARSING_SCHEMA_NAME NOT IN (
+                    SELECT USERNAME FROM DBA_USERS
+                    WHERE ACCOUNT_STATUS LIKE '%LOCKED%'
+                       OR USERNAME IN ('SYS', 'SYSTEM', 'DBSNMP', 'OUTLN', 'AUDSYS')
+                )
+            """, bind)
+            sql_ids = [r[0] for r in cursor]
+            print(f"  XPLAN filtered: {len(sql_ids)} SQL IDs (excluded SYS/SYSTEM/LOCKED)")
 
         for sql_id in sql_ids:
             try:
