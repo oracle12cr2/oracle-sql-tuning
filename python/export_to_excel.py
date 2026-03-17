@@ -352,6 +352,49 @@ def query_db_info(config_data):
     return result
 
 
+
+
+def query_display_cursor(config_data, sql_ids):
+    """DBMS_XPLAN.DISPLAY_CURSOR로 실행계획 조회"""
+    results = {}
+    try:
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent))
+        from utils import get_oracle_connection, load_config
+        config = load_config()
+        conn = get_oracle_connection(config)
+        cursor = conn.cursor()
+
+        for sql_id in sql_ids:
+            try:
+                # ALLSTATS LAST: 실제 실행 통계 포함
+                cursor.execute(
+                    "SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(:1, NULL, :2))",
+                    [sql_id, 'ALLSTATS LAST']
+                )
+                lines = [row[0] for row in cursor]
+                if lines and not any('cannot fetch plan' in l for l in lines[:10]):
+                    results[sql_id] = lines
+                else:
+                    # ALLSTATS 없으면 TYPICAL로 재시도
+                    cursor.execute(
+                        "SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(:1, NULL, :2))",
+                        [sql_id, 'TYPICAL']
+                    )
+                    lines = [row[0] for row in cursor]
+                    if lines and not any('cannot fetch plan' in l for l in lines[:10]):
+                        results[sql_id] = lines
+            except Exception as e:
+                print(f"  XPLAN {sql_id}: {e}")
+
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"  XPLAN query error: {e}")
+    return results
+
+
 # ============================================
 # Sheet: DB 접속 정보
 # ============================================
@@ -1295,6 +1338,40 @@ def load_10053_data(trace_dir):
     return results
 
 
+
+def write_xplan_sheet(ws, xplan_data):
+    """실행계획 (DBMS_XPLAN) 시트"""
+    ws.title = "📋 XPLAN 실행계획"
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 140
+
+    row = 1
+    for sql_id, lines in xplan_data.items():
+        # SQL_ID 헤더
+        c = ws.cell(row=row, column=1, value=f"  SQL_ID: {sql_id}  (DBMS_XPLAN.DISPLAY_CURSOR)")
+        c.font = SUB_HEADER_FONT
+        c.fill = SUB_HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[row].height = 22
+        row += 1
+
+        # 실행계획 텍스트
+        plan_text = "\n".join(lines)
+        line_count = len(lines)
+        c = ws.cell(row=row, column=1, value=plan_text)
+        c.font = Font(name="Consolas", size=9, color="000000")
+        c.fill = PatternFill("solid", start_color="FFFFFF")
+        c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        c.border = Border(
+            left=Side(style="dashed", color="2E75B6"),
+            right=Side(style="dashed", color="2E75B6"),
+            top=Side(style="dashed", color="2E75B6"),
+            bottom=Side(style="dashed", color="2E75B6"),
+        )
+        ws.row_dimensions[row].height = max(line_count * 14, 100)
+        row += 3
+
+
 def write_10053_summary(ws, data_list):
     """🔬 10053 요약 시트"""
     ws.title = "🔬 10053 요약"
@@ -1695,8 +1772,26 @@ def main():
     elif db_live.get("error"):
         print(f"  DB connection failed: {db_live['error'][:80]}")
 
+    # XPLAN 조회 (V$SQL에 있는 SQL_ID들)
+    xplan_data = {}
+    if db_live and db_live.get("connected"):
+        # AWR 데이터에서 SQL_ID 추출
+        xplan_sql_ids = list(set(
+            [d.get("sql_id") for d in all_data if d.get("sql_id")] +
+            [d.get("sql_id") for d in data_10053 if d.get("sql_id")]
+        ))
+        if xplan_sql_ids:
+            print(f"XPLAN query: {len(xplan_sql_ids)} SQL IDs...")
+            xplan_data = query_display_cursor(config_data, xplan_sql_ids)
+            print(f"  XPLAN found: {len(xplan_data)} plans")
+
     write_cover_page(ws_cover, all_data, detected_list, tkprof_data, data_10053, config_data)
     write_db_info(ws_dbinfo, config_data, data_10053, all_data, db_live=db_live)
+
+    # XPLAN 시트
+    if xplan_data:
+        ws_xplan = wb.create_sheet("📋 XPLAN 실행계획")
+        write_xplan_sheet(ws_xplan, xplan_data)
 
     # 기존 시트
     ws_summary = wb.create_sheet("📋 요약")
