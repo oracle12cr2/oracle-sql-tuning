@@ -62,8 +62,12 @@ class OptimizerTraceCollector:
             if collection_method == 'explain':
                 # EXPLAIN PLAN 방식
                 if sql_text:
+                    # EXPLAIN PLAN FOR 중복 방지
+                    clean_sql = sql_text.strip()
+                    if clean_sql.upper().startswith("EXPLAIN PLAN"):
+                        clean_sql = clean_sql[len("EXPLAIN PLAN FOR"):].strip()
                     self.logger.info("EXPLAIN PLAN 실행")
-                    cursor.execute(f"EXPLAIN PLAN FOR {sql_text}")
+                    cursor.execute(f"EXPLAIN PLAN FOR {clean_sql}")
                 else:
                     # SQL_ID로부터 SQL 텍스트 조회
                     cursor.execute("""
@@ -75,7 +79,10 @@ class OptimizerTraceCollector:
                     result = cursor.fetchone()
                     if result:
                         sql_text = result[0]
-                        cursor.execute(f"EXPLAIN PLAN FOR {sql_text}")
+                        clean = sql_text.strip()
+                        if clean.upper().startswith("EXPLAIN PLAN"):
+                            clean = clean[len("EXPLAIN PLAN FOR"):].strip()
+                        cursor.execute(f"EXPLAIN PLAN FOR {clean}")
                     else:
                         raise ValueError(f"SQL_ID {sql_id}에 대한 SQL을 찾을 수 없음")
             else:

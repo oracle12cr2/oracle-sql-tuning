@@ -207,6 +207,136 @@ def cmd_report(args):
 # ============================================
 # 전체 파이프라인 실행
 # ============================================
+
+def cmd_target(args):
+    """특정 SQL_ID 타겟 분석 (10046 + tkprof + 10053 + Excel)"""
+    config = load_config(get_config_path())
+    logger = setup_logger("pipeline", config)
+
+    sql_id = args.sql_id
+    db_password = getattr(args, 'db_password', None)
+    skip_10046 = getattr(args, 'skip_10046', False)
+    skip_10053 = getattr(args, 'skip_10053', False)
+    skip_excel = getattr(args, 'skip_excel', False)
+
+    # DB 비밀번호 설정
+    if db_password:
+        pwd_env = config.get("database", {}).get("password_env", "ORACLE_TUNING_PWD")
+        os.environ[pwd_env] = db_password
+        config["database"]["password"] = db_password
+
+    logger.info("=" * 60)
+    logger.info(f"타겟 분석: SQL_ID = {sql_id}")
+    logger.info("=" * 60)
+
+    # SQL 텍스트 조회
+    sql_text = None
+    try:
+        from utils import get_oracle_connection
+        conn = get_oracle_connection(config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT SQL_FULLTEXT FROM V$SQL WHERE SQL_ID = :1 AND ROWNUM = 1", [sql_id])
+        row = cursor.fetchone()
+        if row:
+            sql_text = str(row[0]) if hasattr(row[0], 'read') else str(row[0])
+            logger.info(f"SQL: {sql_text[:100]}...")
+        else:
+            logger.warning(f"V$SQL에서 SQL_ID {sql_id} 못 찾음 (이미 flush됐을 수 있음)")
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"SQL 텍스트 조회 실패: {e}")
+
+    # --- 10046 트레이스 수집 ---
+    trc_file = None
+    if not skip_10046:
+        logger.info("\n" + "=" * 40)
+        logger.info("Step 1: 10046 트레이스 수집")
+        logger.info("=" * 40)
+        try:
+            args.file = None
+            args.wait = None
+            trace_results = cmd_trace(args)
+            collected = [r for r in trace_results if r.get("status") == "collected"]
+            if collected:
+                trc_file = collected[0].get("trace_file")
+                logger.info(f"  수집 완료: {trc_file}")
+            else:
+                logger.warning("  트레이스 수집 실패 (계속 진행)")
+        except Exception as e:
+            logger.warning(f"  10046 오류 (계속 진행): {e}")
+
+    # --- tkprof 분석 ---
+    if trc_file:
+        logger.info("\n" + "=" * 40)
+        logger.info("Step 2: tkprof 분석")
+        logger.info("=" * 40)
+        try:
+            args.file = trc_file
+            cmd_analyze(args)
+        except Exception as e:
+            logger.warning(f"  tkprof 오류 (계속 진행): {e}")
+
+    # --- 10053 옵티마이저 트레이스 ---
+    if not skip_10053:
+        logger.info("\n" + "=" * 40)
+        logger.info("Step 3: 10053 옵티마이저 트레이스")
+        logger.info("=" * 40)
+        try:
+            from optimizer_trace import OptimizerTraceCollector, OptimizerTraceAnalyzer
+            collector = OptimizerTraceCollector(config, logger)
+
+            if sql_text:
+                trc_10053 = collector.collect_10053(sql_id, sql_text)
+                if trc_10053:
+                    logger.info(f"  10053 수집: {trc_10053}")
+                    analyzer = OptimizerTraceAnalyzer(config, logger)
+                    parsed = analyzer.parse_10053(trc_10053)
+                    if parsed:
+                        report_dir = os.path.join(config["paths"]["report_output"], "10053")
+                        os.makedirs(report_dir, exist_ok=True)
+                        report_file = os.path.join(report_dir,
+                            f"10053_{sql_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
+                        analyzer.generate_10053_report(parsed, report_file)
+                        logger.info(f"  10053 리포트: {report_file}")
+            else:
+                logger.warning("  SQL 텍스트 없어서 10053 스킵")
+        except Exception as e:
+            logger.warning(f"  10053 오류 (계속 진행): {e}")
+
+    # --- Excel 리포트 ---
+    if not skip_excel:
+        logger.info("\n" + "=" * 40)
+        logger.info("Step 4: Excel 통합 리포트")
+        logger.info("=" * 40)
+        try:
+            import subprocess
+            excel_cmd = [
+                sys.executable, 'python/export_to_excel.py',
+                '--json', str(Path(config["paths"]["trace_output"])),
+                '--10053', str(Path(config["paths"]["trace_output"])),
+                '--output', str(Path(config["paths"]["report_output"]) /
+                    f"target_{sql_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"),
+            ]
+            if db_password:
+                excel_cmd.extend(['--db-password', db_password])
+            result = subprocess.run(excel_cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if '[OK]' in line:
+                        logger.info(f"  {line.strip()}")
+                        break
+            else:
+                logger.warning(f"  Excel 오류: {result.stderr[:200]}")
+        except Exception as e:
+            logger.warning(f"  Excel 오류 (계속 진행): {e}")
+
+    logger.info("\n" + "=" * 60)
+    logger.info(f"타겟 분석 완료: SQL_ID = {sql_id}")
+    logger.info(f"리포트: {config['paths']['report_output']}")
+    logger.info("=" * 60)
+
+
 def cmd_run(args):
     """Phase 1 → 2 → 3 → 4 → 10053 → Excel 전체 파이프라인"""
     config = load_config(get_config_path())
@@ -908,6 +1038,14 @@ def main():
     p_report.add_argument("--date", type=str, help="대상 날짜 (YYYY-MM-DD)")
 
     # run (전체 파이프라인)
+    # target (특정 SQL_ID 분석)
+    p_target = subparsers.add_parser("target", help="특정 SQL_ID 타겟 분석 (10046+tkprof+10053+Excel)")
+    p_target.add_argument("--sql-id", type=str, required=True, help="분석할 SQL_ID")
+    p_target.add_argument("--db-password", type=str, default=None, help="DB 비밀번호")
+    p_target.add_argument("--skip-10046", action="store_true", help="10046 트레이스 스킵")
+    p_target.add_argument("--skip-10053", action="store_true", help="10053 트레이스 스킵")
+    p_target.add_argument("--skip-excel", action="store_true", help="Excel 리포트 스킵")
+
     p_run = subparsers.add_parser("run", help="전체 파이프라인 (Phase 1→2→3→4→10053→Excel)")
     p_run.add_argument("--skip-detect", action="store_true", help="Phase 1 스킵")
     p_run.add_argument("--skip-10053", action="store_true", help="10053 트레이스 스킵")
@@ -952,6 +1090,7 @@ def main():
         "trace": cmd_trace,
         "analyze": cmd_analyze,
         "report": cmd_report,
+        "target": cmd_target,
         "run": cmd_run,
         "cleanup": cmd_cleanup,
         "install-schedule": cmd_install_schedule,
