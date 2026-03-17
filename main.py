@@ -225,9 +225,36 @@ def cmd_target(args):
         os.environ[pwd_env] = db_password
         config["database"]["password"] = db_password
 
+    # 출력 폴더: output/reports/YYYY.MM.DD_SQL_ID/
+    report_dir = Path(config["paths"]["report_output"]) / f"{datetime.now().strftime('%Y.%m.%d')}_{sql_id}"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
     logger.info("=" * 60)
     logger.info(f"타겟 분석: SQL_ID = {sql_id}")
+    logger.info(f"출력 폴더: {report_dir}")
     logger.info("=" * 60)
+
+    # XPLAN 실행계획 저장
+    try:
+        from utils import get_oracle_connection
+        conn = get_oracle_connection(config)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(:1, NULL, :2))",
+            [sql_id, 'ALLSTATS LAST']
+        )
+        xplan_lines = [row[0] for row in cursor]
+        if xplan_lines and not any('cannot fetch plan' in l for l in xplan_lines[:10]):
+            xplan_file = report_dir / f"xplan_{sql_id}.txt"
+            with open(xplan_file, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(xplan_lines))
+            logger.info(f"XPLAN 저장: {xplan_file}")
+        else:
+            logger.info("XPLAN: 커서에 플랜 없음 (flush됨)")
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"XPLAN 조회 실패: {e}")
 
     # SQL 텍스트 조회
     sql_text = None
@@ -261,6 +288,14 @@ def cmd_target(args):
             if collected:
                 trc_file = collected[0].get("trace_file")
                 logger.info(f"  수집 완료: {trc_file}")
+                # 트레이스 파일을 분석 폴더에 복사
+                if trc_file:
+                    import shutil
+                    try:
+                        shutil.copy2(trc_file, str(report_dir))
+                        logger.info(f"  복사: {report_dir}")
+                    except Exception:
+                        pass
             else:
                 logger.warning("  트레이스 수집 실패 (계속 진행)")
         except Exception as e:
@@ -293,10 +328,7 @@ def cmd_target(args):
                     analyzer = OptimizerTraceAnalyzer(config, logger)
                     parsed = analyzer.parse_10053(trc_10053)
                     if parsed:
-                        report_dir = os.path.join(config["paths"]["report_output"], "10053")
-                        os.makedirs(report_dir, exist_ok=True)
-                        report_file = os.path.join(report_dir,
-                            f"10053_{sql_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
+                        report_file = str(report_dir / f"10053_{sql_id}.html")
                         analyzer.generate_10053_report(parsed, report_file)
                         logger.info(f"  10053 리포트: {report_file}")
             else:
@@ -315,8 +347,7 @@ def cmd_target(args):
                 sys.executable, 'python/export_to_excel.py',
                 '--json', str(Path(config["paths"]["trace_output"])),
                 '--10053', str(Path(config["paths"]["trace_output"])),
-                '--output', str(Path(config["paths"]["report_output"]) /
-                    f"target_{sql_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"),
+                '--output', str(report_dir / f"tuning_report_{sql_id}.xlsx"),
             ]
             if db_password:
                 excel_cmd.extend(['--db-password', db_password])
@@ -333,7 +364,7 @@ def cmd_target(args):
 
     logger.info("\n" + "=" * 60)
     logger.info(f"타겟 분석 완료: SQL_ID = {sql_id}")
-    logger.info(f"리포트: {config['paths']['report_output']}")
+    logger.info(f"리포트: {report_dir}")
     logger.info("=" * 60)
 
 
