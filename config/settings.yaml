@@ -1,206 +1,168 @@
-# Oracle SQL 튜닝 자동화 파이프라인 설정
+# ============================================
+# Oracle SQL Tuning Automation - 설정 파일
+# ============================================
 
-# --- 데이터베이스 연결 ---
+# --- Oracle 접속 정보 (RAC 환경) ---
 database:
-  host: "192.168.50.31"
+  user: "app_user"
+  # password는 환경변수 ORACLE_TUNING_PWD 또는 Oracle Wallet 사용 권장
+  password_env: "ORACLE_TUNING_PWD"
+  # SCAN Listener로 접속 (RAC 로드밸런싱)
+  host: "192.168.50.35"
   port: 1521
+  # SID 또는 Service Name 중 하나만 설정 (service_name 우선)
+  sid: ""
   service_name: "PROD"
-  username: "app_user"
-  password: "your_password_here"  # 실제 운영 시 환경변수나 보안 파일 사용
-  
-  # 트레이스 파일 디렉터리 (Oracle 서버)
-  trace_directory: "/u01/app/oracle/diag/rdbms/prod/prod/trace"
-  
-  # SSH 접속 (트레이스 파일 수집용)
-  ssh:
-    host: "192.168.50.31"
-    port: 22
-    username: "oracle"
-    key_file: "~/.ssh/id_rsa"  # SSH 키 파일 경로
+  as_sysdba: false
+  # RAC 환경 설정
+  rac_instances:
+    - "PROD1"
+    - "PROD2"
+  # RAC 노드 정보
+  rac_nodes:
+    - host: "192.168.50.31"     # oracle19cogg01
+      instance: "PROD1"
+      vip: "192.168.50.33"
+    - host: "192.168.50.32"     # oracle19cogg02
+      instance: "PROD2"
+      vip: "192.168.50.34"
+  # SCAN Listener
+  scan_name: "oracle19cogg-scan"
+  scan_ips:
+    - "192.168.50.35"
+    - "192.168.50.36"
+    - "192.168.50.37"
 
-# --- 출력 설정 ---
-output:
-  base_directory: "D:/oracle-sql-tuning/output"
-  
-  # 디렉터리 구조
-  directories:
-    reports: "reports"
-    traces: "traces"
-    excel: "excel"
-    logs: "logs"
-  
-  # 파일 보관 설정
-  retention:
-    trace_files_days: 30
-    report_files_days: 90
+# --- Phase 1: 느린 SQL 감지 임계값 ---
+detection:
+  # elapsed_time 임계값 (초) - 이 값 이상이면 느린 SQL로 판정
+  elapsed_threshold_sec: 3
+  # buffer_gets 임계값 - 실행당 buffer gets가 이 값 이상
+  buffer_gets_threshold: 100000
+  # disk_reads 임계값 - 실행당 disk reads가 이 값 이상
+  disk_reads_threshold: 10000
+  # 최근 N분 이내 실행된 SQL만 대상
+  recent_minutes: 1440
+  # 제외할 SQL 패턴 (정규식)
+  exclude_patterns:
+    - "^SELECT .* FROM V\\$"       # V$ 뷰 조회 제외
+    - "^SELECT .* FROM GV\\$"      # GV$ 뷰 조회 제외
+    - "^/\\*.*tuning_auto\\*/"     # 자동화 도구 자체 쿼리 제외
+    - "DBMS_"                       # DBMS 패키지 호출 제외
+  # 제외할 사용자
+  exclude_users:
+    - "SYS"
+    - "SYSTEM"
+    - "DBSNMP"
+    - "OUTLN"
+  # 이미 수집한 SQL 중복 방지 (sql_id 기반, 보관 시간)
+  dedup_retention_hours: 24
+  # cron 실행 간격 (분)
+  cron_interval_min: 5
 
-# --- Phase 1: 느린 SQL 감지 ---
-slow_sql_detection:
-  enabled: true
-  
-  # 감지 기준
-  thresholds:
-    elapsed_time_ms: 5000      # 5초 이상
-    cpu_time_ms: 3000          # CPU 3초 이상
-    executions: 10             # 실행 횟수 10회 이상
-    buffer_gets_per_exec: 10000 # 실행당 Buffer Gets
-  
-  # 조회 설정
-  query_settings:
-    time_window_hours: 24      # 최근 24시간
-    max_results: 100           # 최대 결과 수
-    exclude_sys_users: true    # 시스템 유저 제외
-
-# --- Phase 2: 10046 트레이스 수집 ---
-trace_collection:
-  enabled: true
-  
-  # 트레이스 레벨 (8: 바인드 변수, 12: 바인드+대기이벤트)
+# --- Phase 2: 트레이스 수집 ---
+trace:
+  # 10046 트레이스 레벨 (1=기본, 4=바인드변수, 8=대기이벤트, 12=바인드+대기)
   trace_level: 12
-  
-  # 수집 설정
-  collection:
-    max_concurrent: 3          # 동시 수집 최대 수
-    timeout_minutes: 30        # 수집 타임아웃
-    sample_executions: 5       # 샘플 실행 횟수
-  
-  # 트레이스 파일 정리
-  cleanup:
-    auto_cleanup: true
-    retention_days: 7
+  # 트레이스 최대 수집 시간 (초) - 이 시간 초과 시 자동 종료
+  max_trace_duration_sec: 300
+  # Oracle trace 파일 디렉토리 (user_dump_dest 또는 diag)
+  # 비워두면 자동 감지
+  trace_dir: ""
+  # 트레이스 파일 보관 일수
+  retention_days: 30
+  # SSH 접속 정보 (Windows PC → DB 서버에서 트레이스 파일 가져오기)
+  # Oracle trace 파일 디렉토리 (RAC 노드별로 다를 수 있음)
+  trace_dir: "/oralog/diag/rdbms/prod/PROD1/trace"
+  # SSH 접속 정보 (Windows PC → DB 서버에서 트레이스 파일 가져오기)
+  ssh:
+    enabled: true
+    host: "192.168.50.31"  # 노드1 (oracle19cogg01)
+    port: 22
+    user: "oracle"         # SSH 접속 사용자
+    # 인증 방식: key 또는 password
+    auth_method: "key"              # "key" 또는 "password"
+    key_path: "~/.ssh/id_ed25519"   # SSH 개인키 경로 (ed25519)
+    password_env: "SSH_PWD"         # password 방식일 때 환경변수명
+    # RAC 노드별 SSH (10046/10053 수집 시 접속한 인스턴스의 노드로 연결)
+    rac_ssh:
+      PROD1:
+        host: "192.168.50.31"
+        trace_dir: "/oralog/diag/rdbms/prod/PROD1/trace"
+      PROD2:
+        host: "192.168.50.32"
+        trace_dir: "/oralog/diag/rdbms/prod/PROD2/trace"
 
 # --- Phase 3: tkprof 분석 ---
-tkprof_analysis:
-  enabled: true
-  
-  # tkprof 옵션
-  options:
-    sort: "prsela"            # Parse Elapsed 시간 순 정렬
-    print: 20                 # 상위 20개 SQL 출력
-    sys: false                # 시스템 SQL 제외
-    explain: true             # 실행계획 포함
-  
-  # 분석 임계값
-  thresholds:
-    high_parse_ratio: 0.3     # Parse/Execute 비율 (30% 이상 시 경고)
-    high_fetch_count: 1000    # Fetch 횟수 (1000회 이상 시 경고)
+tkprof:
+  # tkprof 바이너리 경로 (비워두면 $ORACLE_HOME/bin/tkprof)
+  binary_path: ""
+  # 정렬 기준 (exeela=실행시간, fchela=fetch시간, prsela=파싱시간)
+  sort_option: "exeela"
+  # 실행계획 포함 여부
+  explain_user: ""  # 비워두면 explain plan 생략, 사용자명 넣으면 해당 사용자로 explain
+  # 개선 포인트 자동 태깅 규칙
+  analysis_rules:
+    full_table_scan_threshold: 10000    # 이 행수 이상 FTS는 경고
+    nested_loop_threshold: 100000       # NL 조인 대상 행수 경고
+    buffer_gets_per_row_threshold: 100  # 행당 buffer gets 경고
 
-# --- Phase 4: AWR 연계 보고서 ---
-awr_integration:
-  enabled: true
-  
-  # AWR 스냅샷 설정
-  snapshot:
-    interval_minutes: 30      # AWR 스냅샷 간격
-    retention_days: 7         # AWR 데이터 보관 기간
-  
-  # 보고서 설정
-  report:
-    include_ash: true         # ASH 데이터 포함
-    include_addm: true        # ADDM 권고사항 포함
-    detail_level: "typical"   # basic, typical, all
+# --- Phase 4: 리포트 ---
+report:
+  # 리포트 유형
+  daily_enabled: true
+  weekly_enabled: true
+  weekly_day: "MON"  # 주간 리포트 생성 요일
+  # AWR 스냅샷 연계
+  awr:
+    # Top SQL 개수
+    top_n: 20
+    # 스냅샷 간격 기준 (시간)
+    snapshot_interval_hours: 1
+  # 출력 형식
+  output_formats:
+    - "html"
+    - "xlsx"
+  # 메일 발송
+  email:
+    enabled: false
+    smtp_host: ""
+    smtp_port: 587
+    from_addr: ""
+    to_addrs: []
+    subject_prefix: "[Oracle Tuning]"
+
+# --- 공통 경로 ---
+# 상대경로 사용 시 프로젝트 루트(main.py 위치) 기준으로 자동 해석
+# 절대경로로 변경 가능 (Windows: C:\oracle-tuning, Linux: /opt/oracle-tuning)
+paths:
+  base_dir: "."
+  log_dir: "./logs"
+  trace_output: "./output/traces"
+  tkprof_output: "./output/tkprof"
+  report_output: "./output/reports"
+  dedup_db: "./data/dedup.sqlite"
+
+# --- 로깅 ---
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  max_size_mb: 50
+  backup_count: 5
 
 # --- 10053 옵티마이저 트레이스 ---
 optimizer_trace:
   enabled: true
-  
   # 수집 방식: explain (EXPLAIN PLAN만) 또는 execute (실제 실행)
   collection_method: "explain"
-  
   # 트레이스 파일 보관 일수
   retention_days: 30
-  
   # 수집 제한
   limits:
-    max_concurrent: 2         # 동시 수집 최대 수 (10053은 부하가 클 수 있음)
-    timeout_minutes: 15       # 수집 타임아웃
-    max_file_size_mb: 100     # 최대 트레이스 파일 크기
-  
+    max_concurrent: 2
+    timeout_minutes: 15
+    max_file_size_mb: 100
   # 분석 규칙
   analysis_rules:
-    # 카디널리티 오차 임계값 (배수) - 실제 vs 추정
     cardinality_error_threshold: 10
-    
-    # 통계 부정확 경고 (마지막 통계 수집 후 경과 일수)
     stale_stats_days: 30
-    
-    # 비용 차이 임계값 (2nd best 대비 %)
     cost_diff_threshold: 20
-    
-    # Full Table Scan 경고 (테이블 크기 임계값)
-    fts_threshold_blocks: 1000
-  
-  # 리포트 설정
-  report:
-    include_parameters: true   # 옵티마이저 파라미터 포함
-    include_statistics: true   # 테이블 통계 포함
-    include_cost_analysis: true # 비용 분석 포함
-    include_recommendations: true # 개선 권고사항 포함
-
-# --- 엑셀 내보내기 ---
-excel_export:
-  enabled: true
-  
-  # 파일명 형식
-  filename_format: "SQL_Tuning_Report_{timestamp}.xlsx"
-  
-  # 시트 구성
-  sheets:
-    slow_sql_summary: "느린 SQL 요약"
-    trace_analysis: "트레이스 분석"
-    optimizer_decisions: "옵티마이저 결정"  # 10053 분석 결과
-    recommendations: "개선 권고사항"
-    awr_summary: "AWR 요약"
-  
-  # 차트 및 포맷팅
-  formatting:
-    auto_filter: true         # 자동 필터 적용
-    freeze_header: true       # 헤더 고정
-    conditional_formatting: true # 조건부 서식
-
-# --- 로깅 ---
-logging:
-  level: "INFO"               # DEBUG, INFO, WARNING, ERROR
-  file: "logs/sql_tuning.log"
-  max_size_mb: 50
-  backup_count: 5
-  
-  # 각 모듈별 로깅 레벨
-  modules:
-    slow_sql_detector: "INFO"
-    trace_collector: "INFO"
-    optimizer_trace: "INFO"    # 10053 트레이스 로깅
-    tkprof_analyzer: "DEBUG"
-    report_generator: "INFO"
-
-# --- 알림 설정 ---
-notifications:
-  enabled: false
-  
-  # 이메일 설정 (선택사항)
-  email:
-    smtp_server: "smtp.company.com"
-    smtp_port: 587
-    username: "sql-tuning@company.com"
-    password: "password"
-    recipients: ["dba@company.com"]
-  
-  # 알림 조건
-  conditions:
-    critical_slow_sql: true    # 심각한 느린 SQL 감지 시
-    trace_collection_failed: true # 트레이스 수집 실패 시
-    high_cost_difference: true # 10053 분석에서 높은 비용 차이 감지 시
-
-# --- 보안 설정 ---
-security:
-  # 민감한 정보 마스킹
-  mask_sensitive_data: true
-  
-  # 로그에서 제외할 패턴
-  exclude_patterns:
-    - "password"
-    - "secret"
-    - "token"
-  
-  # 접근 제한
-  allowed_users: ["app_user", "dba_user"]  # 10053 트레이스 수집 허용 유저
