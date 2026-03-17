@@ -226,9 +226,136 @@ def write_cover_page(ws, all_data, detected_list, tkprof_data, data_10053, confi
 
 
 # ============================================
+# DB Live Query
+# ============================================
+def query_db_info(config_data):
+    """DB에 접속하여 인스턴스/데이터베이스/SGA/PGA/파라미터 정보 조회"""
+    result = {
+        'connected': False,
+        'error': None,
+        'instance': {},
+        'database': {},
+        'version': [],
+        'sga': [],
+        'pga': {},
+        'os': {},
+        'parameters': {},
+        'rac_instances': [],
+    }
+
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from utils import get_oracle_connection, load_config
+
+        config = load_config()
+        conn = get_oracle_connection(config)
+        cursor = conn.cursor()
+        result['connected'] = True
+
+        # V$INSTANCE
+        cursor.execute("""
+            SELECT INSTANCE_NUMBER, INSTANCE_NAME, HOST_NAME, VERSION_FULL,
+                   STARTUP_TIME, STATUS, DATABASE_STATUS, INSTANCE_ROLE,
+                   ACTIVE_STATE, LOGINS, PARALLEL
+            FROM V$INSTANCE
+        """)
+        cols = [d[0] for d in cursor.description]
+        row = cursor.fetchone()
+        if row:
+            result['instance'] = dict(zip(cols, row))
+
+        # V$DATABASE
+        cursor.execute("""
+            SELECT DBID, NAME, DB_UNIQUE_NAME, CREATED, LOG_MODE,
+                   OPEN_MODE, PROTECTION_MODE, DATABASE_ROLE,
+                   PLATFORM_NAME, FLASHBACK_ON, FORCE_LOGGING
+            FROM V$DATABASE
+        """)
+        cols = [d[0] for d in cursor.description]
+        row = cursor.fetchone()
+        if row:
+            result['database'] = dict(zip(cols, row))
+
+        # V$VERSION
+        cursor.execute("SELECT BANNER_FULL FROM V$VERSION WHERE ROWNUM <= 3")
+        result['version'] = [r[0] for r in cursor.fetchall()]
+
+        # V$SGA
+        cursor.execute("SELECT NAME, VALUE FROM V$SGA")
+        result['sga'] = [(r[0], r[1]) for r in cursor.fetchall()]
+
+        # PGA
+        cursor.execute("""
+            SELECT NAME, VALUE FROM V$PGASTAT
+            WHERE NAME IN ('aggregate PGA target parameter',
+                           'aggregate PGA auto target',
+                           'total PGA allocated',
+                           'total PGA inuse',
+                           'maximum PGA allocated')
+        """)
+        for name, val in cursor.fetchall():
+            result['pga'][name] = val
+
+        # OS 정보
+        cursor.execute("""
+            SELECT STAT_NAME, VALUE FROM V$OSSTAT
+            WHERE STAT_NAME IN ('NUM_CPUS', 'NUM_CPU_CORES', 'NUM_CPU_SOCKETS',
+                                'PHYSICAL_MEMORY_BYTES', 'IDLE_TIME', 'BUSY_TIME')
+        """)
+        for name, val in cursor.fetchall():
+            result['os'][name] = val
+
+        # 주요 파라미터
+        cursor.execute("""
+            SELECT NAME, VALUE, ISDEFAULT, DESCRIPTION FROM V$PARAMETER
+            WHERE NAME IN (
+                'optimizer_mode', 'optimizer_features_enable',
+                'db_block_size', 'db_file_multiblock_read_count',
+                'pga_aggregate_target', 'sga_target', 'sga_max_size',
+                'memory_target', 'memory_max_target',
+                'cursor_sharing', 'statistics_level',
+                'optimizer_adaptive_plans', 'optimizer_adaptive_statistics',
+                'parallel_max_servers', 'parallel_threads_per_cpu',
+                'result_cache_mode', 'inmemory_size',
+                'undo_tablespace', 'undo_retention',
+                'open_cursors', 'session_cached_cursors',
+                'db_keep_cache_size', 'db_recycle_cache_size',
+                'log_buffer', 'processes', 'sessions'
+            )
+            ORDER BY NAME
+        """)
+        for name, val, isdef, desc in cursor.fetchall():
+            result['parameters'][name] = {
+                'value': val,
+                'is_default': isdef == 'TRUE',
+                'description': desc
+            }
+
+        # RAC 인스턴스 (GV$INSTANCE)
+        try:
+            cursor.execute("""
+                SELECT INST_ID, INSTANCE_NAME, HOST_NAME, STATUS, STARTUP_TIME
+                FROM GV$INSTANCE ORDER BY INST_ID
+            """)
+            cols = [d[0] for d in cursor.description]
+            result['rac_instances'] = [dict(zip(cols, r)) for r in cursor.fetchall()]
+        except Exception:
+            pass
+
+        cursor.close()
+        conn.close()
+
+    except Exception as e:
+        result['error'] = str(e)
+        print(f"  DB query warning: {e}")
+
+    return result
+
+
+# ============================================
 # Sheet: DB 접속 정보
 # ============================================
-def write_db_info(ws, config_data, data_10053, all_data):
+def write_db_info(ws, config_data, data_10053, all_data, db_live=None):
     """🔌 DB 접속 정보 시트"""
     ws.title = "🔌 DB 접속 정보"
     ws.sheet_view.showGridLines = False
@@ -404,6 +531,181 @@ def write_db_info(ws, config_data, data_10053, all_data):
                 scell(ws, row, 4, info.get("default", ""), mono=True, align="right", fill=fill)
                 ws.row_dimensions[row].height = 18
                 row += 1
+
+    # ══════════════════════════════════════════
+    # DB Live Query 결과 (V$INSTANCE, V$DATABASE 등)
+    # ══════════════════════════════════════════
+    if db_live and db_live.get("connected"):
+        row += 1
+
+        def _section_header(title):
+            nonlocal row
+            ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=4)
+            c = ws.cell(row=row, column=2, value=f"  {title}")
+            c.font = SUB_HEADER_FONT
+            c.fill = PatternFill("solid", start_color="1F3864")
+            c.alignment = Alignment(horizontal="left", vertical="center")
+            ws.row_dimensions[row].height = 24
+            row += 1
+
+        def _kv_table(items, col_headers=("항목", "값")):
+            nonlocal row
+            for ci, h in enumerate(col_headers, 2):
+                hcell(ws, row, ci, h, [28, 40][ci-2] if len(col_headers) == 2 else [28, 30, 20][ci-2])
+            row += 1
+            for label, value in items:
+                fill = ALT_FILL if row % 2 == 0 else None
+                scell(ws, row, 2, label, bold=True, fill=fill)
+                val_str = str(value) if value is not None else ""
+                scell(ws, row, 3, val_str, mono=True, fill=fill)
+                ws.row_dimensions[row].height = 18
+                row += 1
+            row += 1
+
+        # ── V$INSTANCE ──
+        inst = db_live.get("instance", {})
+        if inst:
+            _section_header("V$INSTANCE (실시간 인스턴스 정보)")
+            inst_items = [
+                ("Instance Number", inst.get("INSTANCE_NUMBER")),
+                ("Instance Name", inst.get("INSTANCE_NAME")),
+                ("Host Name", inst.get("HOST_NAME")),
+                ("Version", inst.get("VERSION_FULL")),
+                ("Startup Time", str(inst.get("STARTUP_TIME", ""))),
+                ("Status", inst.get("STATUS")),
+                ("Database Status", inst.get("DATABASE_STATUS")),
+                ("Instance Role", inst.get("INSTANCE_ROLE")),
+                ("Active State", inst.get("ACTIVE_STATE")),
+                ("Logins", inst.get("LOGINS")),
+                ("Parallel", inst.get("PARALLEL")),
+            ]
+            _kv_table(inst_items)
+
+        # ── V$DATABASE ──
+        db = db_live.get("database", {})
+        if db:
+            _section_header("V$DATABASE (데이터베이스 정보)")
+            db_items = [
+                ("DBID", db.get("DBID")),
+                ("Database Name", db.get("NAME")),
+                ("DB Unique Name", db.get("DB_UNIQUE_NAME")),
+                ("Created", str(db.get("CREATED", ""))),
+                ("Log Mode", db.get("LOG_MODE")),
+                ("Open Mode", db.get("OPEN_MODE")),
+                ("Protection Mode", db.get("PROTECTION_MODE")),
+                ("Database Role", db.get("DATABASE_ROLE")),
+                ("Platform", db.get("PLATFORM_NAME")),
+                ("Flashback", db.get("FLASHBACK_ON")),
+                ("Force Logging", db.get("FORCE_LOGGING")),
+            ]
+            _kv_table(db_items)
+
+        # ── V$VERSION ──
+        versions = db_live.get("version", [])
+        if versions:
+            _section_header("V$VERSION (Oracle 버전)")
+            for v in versions:
+                scell(ws, row, 2, v, mono=True)
+                ws.row_dimensions[row].height = 18
+                row += 1
+            row += 1
+
+        # ── RAC 인스턴스 (GV$INSTANCE) ──
+        rac = db_live.get("rac_instances", [])
+        if len(rac) > 1:
+            _section_header("GV$INSTANCE (RAC 인스턴스 목록)")
+            rac_headers = ["Inst#", "Instance Name", "Host Name", "Status", "Startup Time"]
+            for ci, h in enumerate(rac_headers, 2):
+                hcell(ws, row, ci, h, [8, 16, 20, 10, 20][ci-2])
+            row += 1
+            for r_inst in rac:
+                fill = GOOD_FILL if r_inst.get("STATUS") == "OPEN" else WARN_FILL
+                scell(ws, row, 2, r_inst.get("INST_ID"), align="center", fill=fill)
+                scell(ws, row, 3, r_inst.get("INSTANCE_NAME"), mono=True, fill=fill)
+                scell(ws, row, 4, r_inst.get("HOST_NAME"), mono=True, fill=fill)
+                scell(ws, row, 5, r_inst.get("STATUS"), align="center", fill=fill)
+                scell(ws, row, 6, str(r_inst.get("STARTUP_TIME", "")), fill=fill)
+                ws.row_dimensions[row].height = 18
+                row += 1
+            row += 1
+
+        # ── V$SGA ──
+        sga = db_live.get("sga", [])
+        if sga:
+            _section_header("V$SGA (메모리 구성)")
+            for ci, h in enumerate(("구성 요소", "크기"), 2):
+                hcell(ws, row, ci, h, [28, 20][ci-2])
+            row += 1
+            for name, val in sga:
+                fill = ALT_FILL if row % 2 == 0 else None
+                size_mb = float(val) / (1024 * 1024) if val else 0
+                scell(ws, row, 2, name, bold=True, fill=fill)
+                scell(ws, row, 3, f"{size_mb:,.1f} MB", mono=True, align="right", fill=fill)
+                ws.row_dimensions[row].height = 18
+                row += 1
+            row += 1
+
+        # ── PGA ──
+        pga = db_live.get("pga", {})
+        if pga:
+            _section_header("PGA 메모리")
+            for ci, h in enumerate(("항목", "크기"), 2):
+                hcell(ws, row, ci, h, [35, 20][ci-2])
+            row += 1
+            for name, val in pga.items():
+                fill = ALT_FILL if row % 2 == 0 else None
+                size_mb = float(val) / (1024 * 1024) if val else 0
+                scell(ws, row, 2, name, bold=True, fill=fill)
+                scell(ws, row, 3, f"{size_mb:,.1f} MB", mono=True, align="right", fill=fill)
+                ws.row_dimensions[row].height = 18
+                row += 1
+            row += 1
+
+        # ── OS 정보 ──
+        os_info = db_live.get("os", {})
+        if os_info:
+            _section_header("OS 정보 (V$OSSTAT)")
+            os_items = []
+            for name, val in os_info.items():
+                if "MEMORY" in name:
+                    os_items.append((name, f"{float(val) / (1024**3):,.1f} GB"))
+                elif "CPU" in name:
+                    os_items.append((name, str(int(val))))
+                else:
+                    os_items.append((name, str(val)))
+            _kv_table(os_items)
+
+        # ── 주요 파라미터 (V$PARAMETER) ──
+        params = db_live.get("parameters", {})
+        if params:
+            _section_header("주요 초기화 파라미터 (V$PARAMETER)")
+            param_headers = ["파라미터", "값", "기본값?"]
+            for ci, h in enumerate(param_headers, 2):
+                hcell(ws, row, ci, h, [35, 25, 10][ci-2])
+            row += 1
+            for name, info in sorted(params.items()):
+                is_def = info.get("is_default", True)
+                fill = None if is_def else WARN_FILL
+                scell(ws, row, 2, name, mono=True, fill=fill)
+                # 큰 숫자는 MB로 변환 표시
+                val = info.get("value", "")
+                if val and val.isdigit() and int(val) > 1048576:
+                    val_display = f"{val} ({int(val)/(1024*1024):,.0f} MB)"
+                else:
+                    val_display = val
+                scell(ws, row, 3, val_display, mono=True, fill=fill)
+                scell(ws, row, 4, "Y" if is_def else "N (변경됨)", align="center",
+                      fill=fill, bold=not is_def)
+                ws.row_dimensions[row].height = 18
+                row += 1
+
+    elif db_live and db_live.get("error"):
+        row += 1
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=4)
+        c = ws.cell(row=row, column=2, value=f"  DB 접속 실패: {db_live['error']}")
+        c.font = Font(name="Arial", bold=True, color="FF0000", size=10)
+        c.fill = DANGER_FILL
+        ws.row_dimensions[row].height = 24
 
 
 # ============================================
@@ -1322,6 +1624,8 @@ def main():
                         help="출력 엑셀 파일 경로")
     parser.add_argument("--10053", dest="trace_10053", type=str, default=None,
                         help="10053 트레이스 파일 디렉토리 (예: output/traces/)")
+    parser.add_argument("--db-password", dest="db_password", type=str, default=None,
+                        help="DB 비밀번호 (환경변수 대신 직접 전달)")
     parser.add_argument("--config", type=str, default=None)
     args = parser.parse_args()
 
@@ -1378,8 +1682,21 @@ def main():
     # 맨 앞 시트: 튜닝 보고서 + DB 접속 정보
     ws_cover   = wb.create_sheet("📄 튜닝 보고서")
     ws_dbinfo  = wb.create_sheet("🔌 DB 접속 정보")
+    # DB Live Query
+    # Windows 환경변수 전달 문제 우회: --db-password 옵션 지원
+    if hasattr(args, 'db_password') and args.db_password:
+        import os
+        pwd_env = config_data.get("database", {}).get("password_env", "ORACLE_TUNING_PWD")
+        os.environ[pwd_env] = args.db_password
+    print("DB live query...")
+    db_live = query_db_info(config_data)
+    if db_live.get("connected"):
+        print(f"  DB connected: {db_live['instance'].get('INSTANCE_NAME', '?')} @ {db_live['instance'].get('HOST_NAME', '?')}")
+    elif db_live.get("error"):
+        print(f"  DB connection failed: {db_live['error'][:80]}")
+
     write_cover_page(ws_cover, all_data, detected_list, tkprof_data, data_10053, config_data)
-    write_db_info(ws_dbinfo, config_data, data_10053, all_data)
+    write_db_info(ws_dbinfo, config_data, data_10053, all_data, db_live=db_live)
 
     # 기존 시트
     ws_summary = wb.create_sheet("📋 요약")
