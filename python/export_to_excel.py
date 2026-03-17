@@ -82,6 +82,331 @@ def freeze(ws, cell="A2"):
     ws.freeze_panes = cell
 
 # ============================================
+# Sheet 0: 튜닝 보고서 (Cover / Executive Summary)
+# ============================================
+def write_cover_page(ws, all_data, detected_list, tkprof_data, data_10053, config_data):
+    """📄 튜닝 보고서 표지 + 요약"""
+    ws.title = "📄 튜닝 보고서"
+    ws.sheet_view.showGridLines = False
+
+    # 컬럼 폭 설정
+    for ci, w in enumerate([4, 22, 18, 18, 18, 18, 18, 4], 1):
+        set_col_width(ws, ci, w)
+
+    row = 1
+    # ── 타이틀 영역 ──
+    ws.merge_cells("B1:G1")
+    ws.row_dimensions[1].height = 12
+    row = 2
+    ws.merge_cells("B2:G2")
+    c = ws.cell(row=2, column=2, value="Oracle SQL Tuning Analysis Report")
+    c.font = Font(name="Arial", bold=True, size=22, color="FFFFFF")
+    c.fill = PatternFill("solid", start_color="1F3864")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 50
+
+    row = 3
+    ws.merge_cells("B3:G3")
+    c = ws.cell(row=3, column=2, value="SQL 튜닝 자동화 분석 보고서")
+    c.font = Font(name="Arial", bold=True, size=14, color="1F3864")
+    c.fill = PatternFill("solid", start_color="EBF3FB")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[3].height = 35
+
+    # ── 보고서 정보 ──
+    row = 5
+    info_items = [
+        ("보고서 생성일", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("분석 대상 DB", config_data.get("database", {}).get("service_name", "") or config_data.get("database", {}).get("sid", "")),
+        ("DB 호스트", config_data.get("database", {}).get("host", "")),
+        ("분석 도구", "Oracle SQL Tuning Automation Pipeline v2.0"),
+    ]
+    for label, value in info_items:
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=3)
+        ws.merge_cells(start_row=row, start_column=4, end_row=row, end_column=6)
+        scell(ws, row, 2, label, bold=True)
+        scell(ws, row, 4, value, mono=True)
+        ws.row_dimensions[row].height = 20
+        row += 1
+
+    row += 1
+
+    # ── 분석 결과 요약 ──
+    ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=7)
+    c = ws.cell(row=row, column=2, value="  분석 결과 요약")
+    c.font = Font(name="Arial", bold=True, size=13, color="FFFFFF")
+    c.fill = PatternFill("solid", start_color="2E75B6")
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[row].height = 28
+    row += 1
+
+    # 통계 카드
+    total_awr = len(all_data)
+    total_detected = len(detected_list)
+    total_tkprof = len(tkprof_data)
+    total_10053 = len(data_10053)
+    total_issues_10053 = sum(len(d.get("issues", [])) for d in data_10053)
+
+    # AWR SQL 중 고위험
+    high_elapsed = sum(1 for d in all_data
+                       for s in (d.get("stats") or [])
+                       if float(s.get("avg_elapsed_sec", 0) or 0) > 5)
+
+    stats_items = [
+        ("📊 AWR 분석 SQL", f"{total_awr}건", "Phase 2-4 파이프라인 분석 대상"),
+        ("🔍 감지된 느린 SQL", f"{total_detected}건", "Phase 1 임계값 초과 SQL"),
+        ("📄 tkprof 분석", f"{total_tkprof}건", "10046 트레이스 분석 결과"),
+        ("🔬 10053 분석", f"{total_10053}건", "옵티마이저 트레이스 분석"),
+        ("🔴 고위험 SQL (>5초)", f"{high_elapsed}건", "평균 경과시간 5초 초과"),
+        ("⚠ 10053 이슈", f"{total_issues_10053}건", "옵티마이저 관련 경고/정보"),
+    ]
+
+    headers = ["항목", "건수", "설명"]
+    for ci, h in enumerate(headers, 2):
+        hcell(ws, row, ci, h, [22, 14, 40][ci-2])
+    ws.row_dimensions[row].height = 22
+    row += 1
+
+    for label, count, desc in stats_items:
+        fill = DANGER_FILL if "고위험" in label and high_elapsed > 0 else (WARN_FILL if "이슈" in label and total_issues_10053 > 0 else None)
+        scell(ws, row, 2, label, bold=True, fill=fill)
+        scell(ws, row, 3, count, align="center", bold=True, fill=fill)
+        scell(ws, row, 4, desc, fill=fill)
+        ws.row_dimensions[row].height = 20
+        row += 1
+
+    row += 1
+
+    # ── 시트 목록 가이드 ──
+    ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=7)
+    c = ws.cell(row=row, column=2, value="  시트 구성 안내")
+    c.font = Font(name="Arial", bold=True, size=13, color="FFFFFF")
+    c.fill = PatternFill("solid", start_color="2E75B6")
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[row].height = 28
+    row += 1
+
+    sheet_guide = [
+        ("📄 튜닝 보고서", "보고서 표지 및 전체 요약 (현재 시트)"),
+        ("🔌 DB 접속 정보", "분석 대상 DB 연결 정보 및 환경"),
+        ("📋 요약", "AWR SQL별 핵심 지표 요약"),
+        ("📊 실행계획", "SQL별 실행계획 전문"),
+        ("📈 AWR 성능통계", "스냅샷별 상세 성능 지표"),
+        ("💡 튜닝 가이드", "자동 분석 기반 튜닝 권장사항"),
+        ("🔍 감지된 느린 SQL", "Phase 1 임계값 초과 SQL 목록"),
+        ("📄 tkprof 원문", "10046 트레이스 tkprof 전문"),
+        ("⏱ Parse-Exec-Fetch", "Parse/Execute/Fetch 단계별 통계"),
+        ("⏳ 대기 이벤트", "Wait Event 분석"),
+        ("🔖 바인드 변수", "사용된 바인드 변수 값"),
+        ("🔬 10053 요약", "10053 옵티마이저 트레이스 요약"),
+        ("🛤 접근 경로", "테이블별 Access Path 비용 비교"),
+        ("📊 10053 통계", "시스템/테이블/인덱스/컬럼 통계"),
+        ("⚠ 10053 이슈", "옵티마이저 관련 이슈 및 권장사항"),
+        ("⚙ 옵티마이저 파라미터", "Altered/Default 파라미터"),
+    ]
+
+    for ci, h in enumerate(["시트", "설명"], 2):
+        hcell(ws, row, ci, h, [22, 55][ci-2])
+    ws.row_dimensions[row].height = 22
+    row += 1
+
+    for sheet_name, desc in sheet_guide:
+        fill = ALT_FILL if row % 2 == 0 else None
+        scell(ws, row, 2, sheet_name, bold=True, fill=fill)
+        scell(ws, row, 3, desc, fill=fill)
+        ws.row_dimensions[row].height = 18
+        row += 1
+
+    row += 2
+    # 푸터
+    ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=7)
+    c = ws.cell(row=row, column=2, value="Generated by Oracle SQL Tuning Automation Pipeline — github.com/oracle12cr2/oracle-sql-tuning")
+    c.font = Font(name="Arial", size=9, italic=True, color="999999")
+    c.alignment = Alignment(horizontal="center")
+
+
+# ============================================
+# Sheet: DB 접속 정보
+# ============================================
+def write_db_info(ws, config_data, data_10053, all_data):
+    """🔌 DB 접속 정보 시트"""
+    ws.title = "🔌 DB 접속 정보"
+    ws.sheet_view.showGridLines = False
+
+    for ci, w in enumerate([4, 28, 35, 25, 4], 1):
+        set_col_width(ws, ci, w)
+
+    row = 1
+    # 타이틀
+    ws.merge_cells("B1:D1")
+    c = ws.cell(row=1, column=2, value="DB 접속 정보 및 환경")
+    c.font = Font(name="Arial", bold=True, size=14, color="1F3864")
+    c.fill = PatternFill("solid", start_color="EBF3FB")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 35
+    row = 3
+
+    # ── 접속 정보 (settings.yaml) ──
+    ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=4)
+    c = ws.cell(row=row, column=2, value="  Oracle 접속 정보 (settings.yaml)")
+    c.font = SUB_HEADER_FONT
+    c.fill = SUB_HEADER_FILL
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[row].height = 24
+    row += 1
+
+    db_cfg = config_data.get("database", {})
+    conn_items = [
+        ("호스트 (Host)", db_cfg.get("host", "")),
+        ("포트 (Port)", str(db_cfg.get("port", 1521))),
+        ("Service Name", db_cfg.get("service_name", "")),
+        ("SID", db_cfg.get("sid", "")),
+        ("접속 사용자", db_cfg.get("user", "")),
+        ("SYSDBA 모드", "Yes" if db_cfg.get("as_sysdba") else "No"),
+        ("RAC 인스턴스", ", ".join(db_cfg.get("rac_instances", [])) or "N/A"),
+        ("비밀번호 환경변수", db_cfg.get("password_env", "")),
+    ]
+
+    hcell(ws, row, 2, "항목", 28)
+    hcell(ws, row, 3, "값", 35)
+    ws.row_dimensions[row].height = 22
+    row += 1
+
+    for label, value in conn_items:
+        fill = ALT_FILL if row % 2 == 0 else None
+        scell(ws, row, 2, label, bold=True, fill=fill)
+        scell(ws, row, 3, value, mono=True, fill=fill)
+        ws.row_dimensions[row].height = 18
+        row += 1
+
+    row += 1
+
+    # ── SSH 접속 정보 ──
+    ssh_cfg = config_data.get("trace", {}).get("ssh", {})
+    if ssh_cfg.get("enabled"):
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=4)
+        c = ws.cell(row=row, column=2, value="  SSH 접속 정보 (트레이스 수집용)")
+        c.font = SUB_HEADER_FONT
+        c.fill = SUB_HEADER_FILL
+        ws.row_dimensions[row].height = 24
+        row += 1
+
+        ssh_items = [
+            ("SSH 호스트", ssh_cfg.get("host", "") or db_cfg.get("host", "") + " (DB호스트 동일)"),
+            ("SSH 포트", str(ssh_cfg.get("port", 22))),
+            ("SSH 사용자", ssh_cfg.get("user", "")),
+            ("인증 방식", ssh_cfg.get("auth_method", "")),
+            ("키 경로", ssh_cfg.get("key_path", "")),
+        ]
+
+        hcell(ws, row, 2, "항목", 28)
+        hcell(ws, row, 3, "값", 35)
+        row += 1
+        for label, value in ssh_items:
+            fill = ALT_FILL if row % 2 == 0 else None
+            scell(ws, row, 2, label, bold=True, fill=fill)
+            scell(ws, row, 3, value, mono=True, fill=fill)
+            ws.row_dimensions[row].height = 18
+            row += 1
+        row += 1
+
+    # ── 인스턴스 정보 (10053 트레이스에서 추출) ──
+    db_info_from_trace = {}
+    if data_10053:
+        for d in data_10053:
+            info = d.get("db_info", {})
+            if info:
+                db_info_from_trace = info
+                break
+
+    if db_info_from_trace:
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=4)
+        c = ws.cell(row=row, column=2, value="  인스턴스 정보 (트레이스에서 추출)")
+        c.font = SUB_HEADER_FONT
+        c.fill = SUB_HEADER_FILL
+        ws.row_dimensions[row].height = 24
+        row += 1
+
+        inst_items = [
+            ("Oracle 버전", db_info_from_trace.get("oracle_version", "")),
+            ("인스턴스 이름", db_info_from_trace.get("instance_name", "")),
+            ("데이터베이스 이름", db_info_from_trace.get("database_name", "")),
+            ("데이터베이스 역할", db_info_from_trace.get("database_role", "")),
+            ("노드 이름", db_info_from_trace.get("node_name", "")),
+        ]
+
+        hcell(ws, row, 2, "항목", 28)
+        hcell(ws, row, 3, "값", 35)
+        row += 1
+        for label, value in inst_items:
+            fill = ALT_FILL if row % 2 == 0 else None
+            scell(ws, row, 2, label, bold=True, fill=fill)
+            scell(ws, row, 3, value, mono=True, fill=fill)
+            ws.row_dimensions[row].height = 18
+            row += 1
+        row += 1
+
+    # ── 감지 임계값 ──
+    det_cfg = config_data.get("detection", {})
+    if det_cfg:
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=4)
+        c = ws.cell(row=row, column=2, value="  감지 임계값 (Phase 1)")
+        c.font = SUB_HEADER_FONT
+        c.fill = SUB_HEADER_FILL
+        ws.row_dimensions[row].height = 24
+        row += 1
+
+        det_items = [
+            ("경과시간 임계값", f"{det_cfg.get('elapsed_threshold_sec', '')}초"),
+            ("Buffer Gets 임계값", f"{det_cfg.get('buffer_gets_threshold', ''):,}"),
+            ("Disk Reads 임계값", f"{det_cfg.get('disk_reads_threshold', ''):,}"),
+            ("최근 대상 범위", f"{det_cfg.get('recent_minutes', '')}분"),
+            ("중복 방지 보관", f"{det_cfg.get('dedup_retention_hours', '')}시간"),
+            ("제외 사용자", ", ".join(det_cfg.get("exclude_users", []))),
+        ]
+
+        hcell(ws, row, 2, "항목", 28)
+        hcell(ws, row, 3, "설정값", 35)
+        row += 1
+        for label, value in det_items:
+            fill = ALT_FILL if row % 2 == 0 else None
+            scell(ws, row, 2, label, bold=True, fill=fill)
+            scell(ws, row, 3, str(value), mono=True, fill=fill)
+            ws.row_dimensions[row].height = 18
+            row += 1
+
+    # ── 시스템 통계 (10053에서) ──
+    if data_10053:
+        sys_stats = data_10053[0].get("system_statistics", {})
+        if sys_stats:
+            row += 1
+            ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=4)
+            c = ws.cell(row=row, column=2, value="  시스템 통계 (System Statistics)")
+            c.font = SUB_HEADER_FONT
+            c.fill = SUB_HEADER_FILL
+            ws.row_dimensions[row].height = 24
+            row += 1
+
+            hcell(ws, row, 2, "항목", 28)
+            hcell(ws, row, 3, "값", 20)
+            hcell(ws, row, 4, "기본값", 15)
+            row += 1
+            stats_type = sys_stats.get("stats_type", "")
+            scell(ws, row, 2, "통계 유형", bold=True)
+            scell(ws, row, 3, stats_type, mono=True, fill=WARN_FILL if stats_type == "NOWORKLOAD" else GOOD_FILL)
+            row += 1
+            for name, info in sys_stats.items():
+                if name == "stats_type" or not isinstance(info, dict):
+                    continue
+                fill = WARN_FILL if info.get("is_default") else None
+                scell(ws, row, 2, name, bold=True, fill=fill)
+                scell(ws, row, 3, info.get("value", ""), mono=True, align="right", fill=fill)
+                scell(ws, row, 4, info.get("default", ""), mono=True, align="right", fill=fill)
+                ws.row_dimensions[row].height = 18
+                row += 1
+
+
+# ============================================
 # Sheet 1: 요약 (Summary)
 # ============================================
 def write_summary(ws, all_data):
@@ -1035,11 +1360,28 @@ def main():
         print("데이터 없음. 종료.")
         sys.exit(1)
 
-    print(f"\nExcel 생성 중: {out_path}")
+    # settings.yaml 로드
+    import yaml
+    config_data = {}
+    config_path = Path(args.config) if args.config else Path(json_path).parent.parent / "config" / "settings.yaml"
+    if not config_path.exists():
+        config_path = Path("config/settings.yaml")
+    if config_path.exists():
+        with open(config_path, encoding="utf-8") as fp:
+            config_data = yaml.safe_load(fp) or {}
+        print(f"  config: {config_path}")
+
+    print(f"\nExcel generating: {out_path}")
     wb = Workbook()
     wb.remove(wb.active)
 
-    # 시트 생성
+    # 맨 앞 시트: 튜닝 보고서 + DB 접속 정보
+    ws_cover   = wb.create_sheet("📄 튜닝 보고서")
+    ws_dbinfo  = wb.create_sheet("🔌 DB 접속 정보")
+    write_cover_page(ws_cover, all_data, detected_list, tkprof_data, data_10053, config_data)
+    write_db_info(ws_dbinfo, config_data, data_10053, all_data)
+
+    # 기존 시트
     ws_summary = wb.create_sheet("📋 요약")
     ws_plan    = wb.create_sheet("📊 실행계획")
     ws_awr     = wb.create_sheet("📈 AWR 성능통계")
