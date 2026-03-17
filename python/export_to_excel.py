@@ -1,639 +1,1086 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-엑셀 내보내기 모듈 - 10053 옵티마이저 분석 시트 포함
+SQL 튜닝 분석 결과를 Excel로 내보내기
+
+사용법:
+    python export_to_excel.py --json output/traces/cj6f6qcqaux57_awr_*.json
+    python export_to_excel.py --json output/traces/  # 디렉토리 전체
+    python export_to_excel.py --detected output/traces/detected_*.json  # Phase1 감지 결과
 """
 
-import os
-import pandas as pd
+import argparse
+import json
+import re
+import sys
 from datetime import datetime
-from typing import Dict, List, Any
+from pathlib import Path
+
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils.dataframe import dataframe_to_rows
-from openpyxl.chart import BarChart, Reference
-from openpyxl.formatting.rule import CellIsRule
+from openpyxl.styles import (Alignment, Border, Font, GradientFill,
+                               PatternFill, Side)
+from openpyxl.utils import get_column_letter
+
+# ============================================
+# 스타일 정의
+# ============================================
+HEADER_FONT      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+HEADER_FILL      = PatternFill("solid", start_color="1F3864")
+SUB_HEADER_FONT  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+SUB_HEADER_FILL  = PatternFill("solid", start_color="2E75B6")
+TITLE_FONT       = Font(name="Arial", bold=True, size=14, color="1F3864")
+LABEL_FONT       = Font(name="Arial", bold=True, size=10, color="1F3864")
+NORMAL_FONT      = Font(name="Arial", size=10)
+MONO_FONT        = Font(name="Consolas", size=9)
+WARN_FILL        = PatternFill("solid", start_color="FFF2CC")
+DANGER_FILL      = PatternFill("solid", start_color="FFE0E0")
+GOOD_FILL        = PatternFill("solid", start_color="E2EFDA")
+ALT_FILL         = PatternFill("solid", start_color="EBF3FB")
+
+THIN_BORDER = Border(
+    left=Side(style="thin", color="BFBFBF"),
+    right=Side(style="thin", color="BFBFBF"),
+    top=Side(style="thin", color="BFBFBF"),
+    bottom=Side(style="thin", color="BFBFBF"),
+)
+MEDIUM_BORDER = Border(
+    left=Side(style="medium", color="2E75B6"),
+    right=Side(style="medium", color="2E75B6"),
+    top=Side(style="medium", color="2E75B6"),
+    bottom=Side(style="medium", color="2E75B6"),
+)
+
+def hcell(ws, row, col, value, width=None):
+    """헤더 셀"""
+    c = ws.cell(row=row, column=col, value=value)
+    c.font = HEADER_FONT
+    c.fill = HEADER_FILL
+    c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    c.border = THIN_BORDER
+    if width:
+        ws.column_dimensions[get_column_letter(col)].width = width
+    return c
+
+def scell(ws, row, col, value, bold=False, mono=False, fill=None, align="left", wrap=False):
+    """일반 데이터 셀"""
+    c = ws.cell(row=row, column=col, value=value)
+    if mono:
+        c.font = MONO_FONT
+    elif bold:
+        c.font = LABEL_FONT
+    else:
+        c.font = NORMAL_FONT
+    c.alignment = Alignment(horizontal=align, vertical="center", wrap_text=wrap)
+    c.border = THIN_BORDER
+    if fill:
+        c.fill = fill
+    return c
+
+def set_col_width(ws, col, width):
+    ws.column_dimensions[get_column_letter(col)].width = width
+
+def freeze(ws, cell="A2"):
+    ws.freeze_panes = cell
+
+# ============================================
+# Sheet 1: 요약 (Summary)
+# ============================================
+def write_summary(ws, all_data):
+    ws.title = "📋 요약"
+    ws.sheet_view.showGridLines = False
+    ws.row_dimensions[1].height = 40
+
+    ws.merge_cells("A1:H1")
+    c = ws["A1"]
+    c.value = "SQL 튜닝 분석 리포트"
+    c.font = TITLE_FONT
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    c.fill = PatternFill("solid", start_color="EBF3FB")
+
+    ws.merge_cells("A2:H2")
+    ws["A2"].value = f"생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  분석 SQL 수: {len(all_data)}건"
+    ws["A2"].font = Font(name="Arial", size=10, italic=True, color="595959")
+    ws["A2"].alignment = Alignment(horizontal="center", vertical="center")
+
+    headers = ["SQL_ID", "SQL 텍스트 (요약)", "Plan Hash Value", "실행계획 줄수",
+               "AWR 스냅샷 수", "평균 경과시간(s)", "평균 Buffer Gets", "소스"]
+    widths  = [20, 50, 18, 14, 14, 18, 20, 20]
+    for i, (h, w) in enumerate(zip(headers, widths), 1):
+        hcell(ws, 3, i, h, w)
+
+    ws.row_dimensions[3].height = 22
+    freeze(ws, "A4")
+
+    for r, d in enumerate(all_data, 4):
+        fill = ALT_FILL if r % 2 == 0 else None
+        sql_preview = (d.get("sql_text") or "")[:80].replace("\n", " ")
+        stats = d.get("stats") or []
+        avg_elapsed = stats[0].get("avg_elapsed_sec", "") if stats else ""
+        avg_buf     = stats[0].get("avg_buffer_gets", "") if stats else ""
+
+        scell(ws, r, 1, d.get("sql_id", ""), mono=True, fill=fill)
+        scell(ws, r, 2, sql_preview, fill=fill, wrap=True)
+        scell(ws, r, 3, d.get("plan_hash_value", ""), align="center", fill=fill)
+        scell(ws, r, 4, len(d.get("plan", [])), align="center", fill=fill)
+        scell(ws, r, 5, len(stats), align="center", fill=fill)
+        scell(ws, r, 6, avg_elapsed, align="right", fill=fill)
+        scell(ws, r, 7, avg_buf, align="right", fill=fill)
+        scell(ws, r, 8, d.get("source", "awr"), align="center", fill=fill)
+        ws.row_dimensions[r].height = 18
+
+# ============================================
+# Sheet 2: 실행계획
+# ============================================
+def write_plans(ws, all_data):
+    ws.title = "📊 실행계획"
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 130
+
+    row = 1
+    for d in all_data:
+        sql_id = d.get("sql_id", "")
+        plan   = d.get("plan", [])
+        if not plan:
+            continue
+
+        # SQL ID 헤더
+        c = ws.cell(row=row, column=1, value=f"  SQL_ID: {sql_id}")
+        c.font = SUB_HEADER_FONT
+        c.fill = SUB_HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[row].height = 22
+        row += 1
+
+        # SQL 텍스트
+        sql_text = (d.get("sql_text") or "").strip()
+        c = ws.cell(row=row, column=1, value=sql_text)
+        c.font = Font(name="Consolas", size=10, color="1F3864")
+        c.fill = PatternFill("solid", start_color="EBF3FB")
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True, indent=1)
+        ws.row_dimensions[row].height = max(32, sql_text.count("\n") * 15 + 15)
+        row += 1
+
+        # 실행계획 전체를 하나의 셀에 텍스트 그대로
+        # 구분선 길이를 가장 긴 줄에 맞춰 통일
+        max_len = max((len(line) for line in plan if line.strip()), default=80)
+        normalized = []
+        for line in plan:
+            # 구분선(-로만 구성)은 max_len만큼 늘려줌
+            if line.strip() and re.match(r"^[-]+$", line.strip()):
+                normalized.append("-" * max_len)
+            else:
+                normalized.append(line)
+        plan_text = "\n".join(normalized)
+        line_count = len(plan)
+
+        c = ws.cell(row=row, column=1, value=plan_text)
+        c.font = Font(name="Consolas", size=10, color="000000")
+        c.fill = PatternFill("solid", start_color="FFFFFF")
+        c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        c.border = Border(
+            left=Side(style="dashed", color="00AA00"),
+            right=Side(style="dashed", color="00AA00"),
+            top=Side(style="dashed", color="00AA00"),
+            bottom=Side(style="dashed", color="00AA00"),
+        )
+        ws.row_dimensions[row].height = line_count * 15
+        row += 3  # SQL 간 여백
+
+# ============================================
+# Sheet 3: AWR 성능 통계
+# ============================================
+def write_awr_stats(ws, all_data):
+    ws.title = "📈 AWR 성능통계"
+    ws.sheet_view.showGridLines = False
+    ws.row_dimensions[1].height = 22
+
+    headers = ["SQL_ID", "스냅샷 시간", "Plan Hash Value", "실행횟수",
+               "평균 경과시간(s)", "평균 CPU(s)", "평균 Buffer Gets",
+               "평균 Disk Reads", "평균 Rows"]
+    widths  = [20, 18, 18, 12, 18, 14, 20, 18, 14]
+    for i, (h, w) in enumerate(zip(headers, widths), 1):
+        hcell(ws, 1, i, h, w)
+
+    freeze(ws, "A2")
+    row = 2
+    for d in all_data:
+        sql_id = d.get("sql_id", "")
+        for s in (d.get("stats") or []):
+            fill = ALT_FILL if row % 2 == 0 else None
+            elapsed = s.get("avg_elapsed_sec") or 0
+            buf     = s.get("avg_buffer_gets") or 0
+            row_fill = DANGER_FILL if float(elapsed) > 5 else (WARN_FILL if float(elapsed) > 1 else fill)
+
+            scell(ws, row, 1, sql_id, mono=True, fill=row_fill)
+            scell(ws, row, 2, s.get("snap_time", ""), fill=row_fill, align="center")
+            scell(ws, row, 3, s.get("plan_hash_value", ""), fill=row_fill, align="center")
+            scell(ws, row, 4, s.get("executions_delta", ""), fill=row_fill, align="right")
+            scell(ws, row, 5, elapsed, fill=row_fill, align="right")
+            scell(ws, row, 6, s.get("avg_cpu_sec", ""), fill=row_fill, align="right")
+            scell(ws, row, 7, buf, fill=row_fill, align="right")
+            scell(ws, row, 8, s.get("avg_disk_reads", ""), fill=row_fill, align="right")
+            scell(ws, row, 9, s.get("avg_rows", ""), fill=row_fill, align="right")
+            ws.row_dimensions[row].height = 16
+            row += 1
+
+    # 색상 범례
+    row += 1
+    ws.cell(row=row, column=1, value="* 색상 기준").font = LABEL_FONT
+    row += 1
+    for color, label in [(DANGER_FILL, "평균 경과시간 > 5초"), (WARN_FILL, "평균 경과시간 > 1초")]:
+        c = ws.cell(row=row, column=1, value=f"  {label}")
+        c.font = NORMAL_FONT
+        c.fill = color
+        row += 1
+
+# ============================================
+# Sheet 4: Phase1 감지 SQL
+# ============================================
+def write_detected(ws, detected_list):
+    ws.title = "🔍 감지된 느린 SQL"
+    ws.sheet_view.showGridLines = False
+    ws.row_dimensions[1].height = 22
+
+    headers = ["SQL_ID", "Plan Hash", "사용자", "모듈",
+               "평균 경과시간(s)", "평균 Buffer Gets", "평균 Disk Reads",
+               "실행횟수", "감지시간"]
+    widths  = [20, 15, 15, 25, 18, 20, 18, 12, 20]
+    for i, (h, w) in enumerate(zip(headers, widths), 1):
+        hcell(ws, 1, i, h, w)
+
+    freeze(ws, "A2")
+    for r, s in enumerate(detected_list, 2):
+        fill = ALT_FILL if r % 2 == 0 else None
+        elapsed = float(s.get("elapsed_time_per_exec", 0) or 0)
+        row_fill = DANGER_FILL if elapsed > 10 else (WARN_FILL if elapsed > 3 else fill)
+
+        scell(ws, r, 1, s.get("sql_id", ""), mono=True, fill=row_fill)
+        scell(ws, r, 2, s.get("plan_hash_value", ""), fill=row_fill, align="center")
+        scell(ws, r, 3, s.get("parsing_user", ""), fill=row_fill)
+        scell(ws, r, 4, s.get("module", ""), fill=row_fill)
+        scell(ws, r, 5, round(elapsed, 3), fill=row_fill, align="right")
+        scell(ws, r, 6, s.get("buffer_gets_per_exec", ""), fill=row_fill, align="right")
+        scell(ws, r, 7, s.get("disk_reads_per_exec", ""), fill=row_fill, align="right")
+        scell(ws, r, 8, s.get("executions", ""), fill=row_fill, align="right")
+        scell(ws, r, 9, s.get("detected_at", ""), fill=row_fill, align="center")
+        ws.row_dimensions[r].height = 16
 
 
-class ExcelExporter:
-    """엑셀 내보내기 클래스"""
-    
-    def __init__(self, config: Dict[str, Any], logger):
-        self.config = config
-        self.logger = logger
-        self.output_dir = os.path.join(
-            config['output']['base_directory'],
-            config['output']['directories']['excel']
-        )
-        
-        # 스타일 정의
-        self.header_font = Font(bold=True, color="FFFFFF")
-        self.header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-        self.header_alignment = Alignment(horizontal="center", vertical="center")
-        
-        self.border_thin = Border(
-            left=Side(style='thin'),
-            right=Side(style='thin'),
-            top=Side(style='thin'),
-            bottom=Side(style='thin')
-        )
-        
-    def export_to_excel(self, all_results: Dict[str, Any]) -> str:
-        """전체 결과를 엑셀 파일로 내보내기"""
-        self.logger.info("엑셀 내보내기 시작")
-        
+# ============================================
+# 튜닝 포인트 분석
+# ============================================
+def analyze_tuning_points(plan_lines, stats):
+    """실행계획과 통계를 분석하여 튜닝 포인트 목록 반환"""
+    issues = []
+    plan_text = "\n".join(plan_lines)
+
+    def parse_num(s):
+        if not s: return 0
+        s = str(s).strip().replace(",", "")
         try:
-            # 파일명 생성
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename_format = self.config.get('excel_export', {}).get('filename_format', 
-                                                                    'SQL_Tuning_Report_{timestamp}.xlsx')
-            filename = filename_format.format(timestamp=timestamp)
-            filepath = os.path.join(self.output_dir, filename)
-            
-            os.makedirs(self.output_dir, exist_ok=True)
-            
-            # Workbook 생성
-            wb = Workbook()
-            wb.remove(wb.active)  # 기본 시트 삭제
-            
-            # 각 시트 생성
-            self._create_summary_sheet(wb, all_results)
-            self._create_slow_sql_sheet(wb, all_results.get('slow_sql_summary', []))
-            self._create_trace_analysis_sheet(wb, all_results.get('trace_results', []), 
-                                            all_results.get('tkprof_results', []))
-            self._create_optimizer_decisions_sheet(wb, all_results.get('optimizer_results', []))
-            self._create_recommendations_sheet(wb, all_results)
-            
-            # 파일 저장
-            wb.save(filepath)
-            
-            self.logger.info(f"엑셀 내보내기 완료: {filepath}")
-            return filepath
-            
+            if s.endswith("K"): return float(s[:-1]) * 1_000
+            if s.endswith("M"): return float(s[:-1]) * 1_000_000
+            if s.endswith("G"): return float(s[:-1]) * 1_000_000_000
+            return float(s)
+        except: return 0
+
+    if stats:
+        s = stats[0]
+        elapsed = float(s.get("avg_elapsed_sec") or 0)
+        buf     = parse_num(s.get("avg_buffer_gets") or 0)
+        reads   = parse_num(s.get("avg_disk_reads") or 0)
+        rows    = parse_num(s.get("avg_rows") or 0)
+
+        if elapsed > 10:
+            issues.append(("HIGH", "과도한 실행시간",
+                f"평균 경과시간 {elapsed:.2f}초. 즉각적인 튜닝 필요.",
+                "실행계획 전체 검토 및 인덱스/조인 방식 재설계 권장"))
+        elif elapsed > 3:
+            issues.append(("MEDIUM", "느린 실행시간",
+                f"평균 경과시간 {elapsed:.2f}초. 튜닝 권장.",
+                "인덱스 효율 및 실행계획 검토"))
+
+        if buf > 1_000_000:
+            issues.append(("HIGH", "과도한 Buffer Gets",
+                f"평균 {buf:,.0f} Buffer Gets. 불필요한 블록 읽기 과다.",
+                "인덱스 클러스터링 팩터 확인, 적합한 인덱스 생성 또는 파티셔닝 검토"))
+        elif buf > 100_000:
+            issues.append(("MEDIUM", "높은 Buffer Gets",
+                f"평균 {buf:,.0f} Buffer Gets.",
+                "인덱스 선택도(Selectivity) 확인 및 복합 인덱스 검토"))
+
+        if reads > 10_000:
+            issues.append(("HIGH", "과도한 Physical Reads",
+                f"평균 {reads:,.0f} Disk Reads. 버퍼 캐시 적중률 저하.",
+                "자주 사용하는 테이블/인덱스 KEEP 버퍼 풀 적용 검토, SGA 크기 확인"))
+
+        if rows > 0 and buf > 0 and (buf / max(rows, 1)) > 100:
+            issues.append(("MEDIUM", "행당 Buffer Gets 과다",
+                f"행당 평균 {buf/max(rows,1):.1f} Buffer Gets.",
+                "인덱스 Range Scan 비효율 또는 클러스터링 팩터 불량 의심\n인덱스 재생성 또는 복합 인덱스 재설계 검토"))
+
+    if "INDEX FAST FULL SCAN" in plan_text:
+        issues.append(("MEDIUM", "INDEX FAST FULL SCAN 감지",
+            "인덱스 전체를 스캔하고 있음. 대용량일 경우 비효율.",
+            "① WHERE 조건에 적합한 복합 인덱스 생성으로 INDEX RANGE SCAN 유도\n"
+            "② SELECT 컬럼이 인덱스에 모두 포함되면 Covering Index 활용\n"
+            "③ DISTINCT/ORDER BY 제거 가능 여부 검토"))
+
+    if "TABLE ACCESS FULL" in plan_text or "FULL TABLE SCAN" in plan_text:
+        issues.append(("HIGH", "Full Table Scan 감지",
+            "테이블 전체를 스캔하고 있음.",
+            "① WHERE 조건 컬럼에 인덱스 생성\n"
+            "② 조건 컬럼의 선택도(Selectivity) 확인\n"
+            "③ 파티션 테이블이라면 파티션 프루닝 여부 확인\n"
+            "④ 소규모 테이블은 Full Scan이 더 효율적일 수 있음"))
+
+    if "PARTITION LIST ALL" in plan_text or "PARTITION RANGE ALL" in plan_text:
+        issues.append(("MEDIUM", "파티션 전체 스캔 (Pruning 미적용)",
+            "파티션 키 조건이 없어 모든 파티션을 스캔 중.",
+            "① WHERE 절에 파티션 키 컬럼 조건 추가\n"
+            "② 파티션 키 설계 재검토 (현재 쿼리 패턴에 맞게 변경)"))
+
+    if "NESTED LOOPS" in plan_text:
+        arows = re.findall(r"NESTED LOOPS[^\n]*\n[^|]*\|[^|]*\|[^|]*\|\s*([\d.KMG]+)\s*\|", plan_text)
+        for ar in arows:
+            if parse_num(ar) > 100_000:
+                issues.append(("MEDIUM", "대용량 Nested Loop Join",
+                    f"Nested Loop에서 {ar} 행 처리.",
+                    "① Hash Join 또는 Sort Merge Join으로 변경 검토\n"
+                    "② 드라이빙 테이블 변경 (/*+ LEADING */ 힌트)\n"
+                    "③ 내부 루프 테이블의 인덱스 효율 확인"))
+                break
+
+    if re.search(r"SORT\s+(UNIQUE|GROUP BY|JOIN|AGGREGATE)", plan_text):
+        issues.append(("LOW", "SORT 연산 발생",
+            "정렬 연산이 포함되어 있음.",
+            "① 정렬 컬럼에 인덱스 생성으로 SORT 연산 제거 가능\n"
+            "② PGA 크기 확인 (work_area_size_policy)\n"
+            "③ 불필요한 DISTINCT, GROUP BY 제거 검토"))
+
+    if "HASH JOIN" in plan_text:
+        issues.append(("LOW", "Hash Join 사용",
+            "Hash Join이 사용 중. 대용량 조인에 일반적으로 적합.",
+            "① PGA 메모리 부족 시 Disk Spill 발생 → v$sql_workarea 확인\n"
+            "② 소용량 테이블 조인이라면 NL Join이 더 효율적일 수 있음"))
+
+    if not issues:
+        issues.append(("GOOD", "특이 사항 없음",
+            "주요 튜닝 포인트가 발견되지 않았습니다.",
+            "현재 실행계획이 적절한 것으로 보입니다."))
+
+    return issues
+
+
+def write_tuning_guide(ws, all_data):
+    """튜닝 가이드 시트 작성"""
+    ws.title = "💡 튜닝 가이드"
+    ws.sheet_view.showGridLines = False
+
+    col_widths = [20, 14, 30, 45, 65]
+    col_headers = ["SQL_ID", "심각도", "유형", "현상", "튜닝 가이드"]
+    for ci, (h, w) in enumerate(zip(col_headers, col_widths), 1):
+        hcell(ws, 1, ci, h, w)
+    ws.row_dimensions[1].height = 22
+    freeze(ws, "A2")
+
+    SEV_FILL = {
+        "HIGH":   PatternFill("solid", start_color="FFE0E0"),
+        "MEDIUM": PatternFill("solid", start_color="FFF2CC"),
+        "LOW":    PatternFill("solid", start_color="E2EFDA"),
+        "GOOD":   PatternFill("solid", start_color="E2EFDA"),
+    }
+    SEV_LABEL = {
+        "HIGH":   "🔴 HIGH",
+        "MEDIUM": "🟡 MEDIUM",
+        "LOW":    "🟢 LOW",
+        "GOOD":   "🟢 GOOD",
+    }
+
+    row = 2
+    for d in all_data:
+        sql_id = d.get("sql_id", "")
+        issues = analyze_tuning_points(d.get("plan", []), d.get("stats", []))
+
+        for severity, issue_type, symptom, guide in issues:
+            fill = SEV_FILL.get(severity)
+            line_count = guide.count("\n") + 1
+
+            for ci, val in enumerate([sql_id, SEV_LABEL.get(severity, severity), issue_type, symptom, guide], 1):
+                c = ws.cell(row=row, column=ci, value=val)
+                c.font = MONO_FONT if ci == 1 else (Font(name="Arial", bold=True, size=10) if ci <= 3 else NORMAL_FONT)
+                c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+                c.border = THIN_BORDER
+                if fill: c.fill = fill
+
+            ws.row_dimensions[row].height = max(30, line_count * 16 + 8)
+            row += 1
+
+        row += 1  # SQL 간 여백
+
+# ============================================
+# 메인
+# ============================================
+def load_awr_jsons(path_pattern):
+    """AWR JSON 파일 로드"""
+    p = Path(path_pattern)
+    files = []
+    if p.is_dir():
+        files = sorted(p.glob("*_awr_*.json"))
+    elif p.is_file():
+        files = [p]
+    else:
+        files = sorted(Path(p.parent).glob(p.name))
+
+    data = []
+    for f in files:
+        try:
+            with open(f, encoding="utf-8") as fp:
+                data.append(json.load(fp))
+            print(f"  로드: {f.name}")
         except Exception as e:
-            self.logger.error(f"엑셀 내보내기 실패: {e}")
-            return None
-    
-    def _create_summary_sheet(self, wb: Workbook, all_results: Dict[str, Any]):
-        """요약 시트 생성"""
-        ws = wb.create_sheet("요약", 0)
-        
-        # 헤더
-        ws['A1'] = 'Oracle SQL 튜닝 분석 요약'
-        ws['A1'].font = Font(size=16, bold=True, color="2F5597")
-        ws.merge_cells('A1:D1')
-        
-        ws['A2'] = f"생성 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        ws.merge_cells('A2:D2')
-        
-        # 요약 통계
-        summary_data = [
-            ['구분', '개수', '비고', '상태'],
-            ['감지된 느린 SQL', len(all_results.get('slow_sql_summary', [])), '분석 대상', '✓'],
-            ['10046 트레이스 수집', len(all_results.get('trace_results', [])), '실행 추적', '✓'],
-            ['10053 옵티마이저 분석', len(all_results.get('optimizer_results', [])), '실행계획 분석', '✓'],
-            ['tkprof 분석', len(all_results.get('tkprof_results', [])), '성능 분석', '✓'],
-            ['생성된 권고사항', 0, '개선 방안', '✓']  # 계산 필요
-        ]
-        
-        # 권고사항 수 계산
-        if 'slow_sql_summary' in all_results:
-            from python.report_generator import ReportGenerator
-            temp_generator = ReportGenerator(self.config, self.logger)
-            temp_data = temp_generator._prepare_report_data(all_results)
-            summary_data[5][1] = len(temp_data.get('recommendations', []))
-        
-        # 데이터 입력
-        for row_idx, row_data in enumerate(summary_data, start=4):
-            for col_idx, value in enumerate(row_data, start=1):
-                cell = ws.cell(row=row_idx, column=col_idx, value=value)
-                if row_idx == 4:  # 헤더 행
-                    cell.font = self.header_font
-                    cell.fill = self.header_fill
-                    cell.alignment = self.header_alignment
-                cell.border = self.border_thin
-        
-        # 열 너비 조정
-        ws.column_dimensions['A'].width = 20
-        ws.column_dimensions['B'].width = 15
-        ws.column_dimensions['C'].width = 20
-        ws.column_dimensions['D'].width = 10
-        
-        # 옵티마이저 분석 요약 (10053)
-        if all_results.get('optimizer_results'):
-            ws['A11'] = '10053 옵티마이저 분석 요약'
-            ws['A11'].font = Font(size=14, bold=True, color="2F5597")
-            ws.merge_cells('A11:D11')
-            
-            optimizer_results = all_results['optimizer_results']
-            
-            # 통계 계산
-            total_issues = sum(len(result.get('parsed_data', {}).get('issues', [])) 
-                             for result in optimizer_results)
-            
-            cost_differences = []
-            for result in optimizer_results:
-                cost_analysis = result.get('parsed_data', {}).get('cost_analysis', {})
-                if cost_analysis.get('cost_difference_pct'):
-                    cost_differences.append(cost_analysis['cost_difference_pct'])
-            
-            avg_cost_diff = sum(cost_differences) / len(cost_differences) if cost_differences else 0
-            
-            optimizer_summary = [
-                ['항목', '값', '단위', '상태'],
-                ['분석 완료 SQL', len(optimizer_results), '개', '✓'],
-                ['발견된 총 이슈', total_issues, '개', '⚠️' if total_issues > 0 else '✓'],
-                ['평균 비용 차이', f'{avg_cost_diff:.1f}', '%', '⚠️' if avg_cost_diff > 30 else '✓'],
-                ['비용 차이 큰 SQL (>50%)', len([d for d in cost_differences if d > 50]), '개', '⚠️' if any(d > 50 for d in cost_differences) else '✓']
-            ]
-            
-            for row_idx, row_data in enumerate(optimizer_summary, start=13):
-                for col_idx, value in enumerate(row_data, start=1):
-                    cell = ws.cell(row=row_idx, column=col_idx, value=value)
-                    if row_idx == 13:  # 헤더 행
-                        cell.font = self.header_font
-                        cell.fill = self.header_fill
-                        cell.alignment = self.header_alignment
-                    cell.border = self.border_thin
-    
-    def _create_slow_sql_sheet(self, wb: Workbook, slow_sqls: List[Dict[str, Any]]):
-        """느린 SQL 시트 생성"""
-        ws = wb.create_sheet("느린 SQL 요약")
-        
-        if not slow_sqls:
-            ws['A1'] = '감지된 느린 SQL이 없습니다.'
-            return
-        
-        # 데이터프레임 생성
-        df_data = []
-        for idx, sql in enumerate(slow_sqls, 1):
-            df_data.append({
-                '순위': idx,
-                'SQL_ID': sql.get('sql_id', ''),
-                '실행시간(ms)': sql.get('elapsed_time_ms', 0),
-                'CPU시간(ms)': sql.get('cpu_time_ms', 0),
-                '실행횟수': sql.get('executions', 0),
-                'Buffer Gets': sql.get('buffer_gets', 0),
-                '평균 실행시간(ms)': sql.get('elapsed_time_ms', 0) / max(sql.get('executions', 1), 1),
-                'Parse Calls': sql.get('parse_calls', 0),
-                'Parse/Exec 비율': sql.get('parse_calls', 0) / max(sql.get('executions', 1), 1),
-                'First Load Time': sql.get('first_load_time', ''),
-                'SQL Text (50자)': (sql.get('sql_text', '')[:50] + '...') if len(sql.get('sql_text', '')) > 50 else sql.get('sql_text', '')
-            })
-        
-        df = pd.DataFrame(df_data)
-        
-        # 데이터프레임을 시트에 추가
-        for r in dataframe_to_rows(df, index=False, header=True):
-            ws.append(r)
-        
-        # 헤더 스타일 적용
-        for cell in ws[1]:
-            cell.font = self.header_font
-            cell.fill = self.header_fill
-            cell.alignment = self.header_alignment
-            cell.border = self.border_thin
-        
-        # 데이터 셀 스타일 적용
-        for row in ws.iter_rows(min_row=2, max_row=len(df)+1):
-            for cell in row:
-                cell.border = self.border_thin
-        
-        # 조건부 서식 적용
-        if len(df) > 0:
-            # 실행시간 기준 색상 조건부 서식
-            elapsed_range = f'C2:C{len(df)+1}'
-            ws.conditional_formatting.add(elapsed_range, 
-                CellIsRule(operator='greaterThan', formula=['10000'], 
-                          fill=PatternFill(start_color='FFD7D7', end_color='FFD7D7')))
-            
-            # Parse/Exec 비율 기준 색상 조건부 서식  
-            parse_range = f'I2:I{len(df)+1}'
-            ws.conditional_formatting.add(parse_range,
-                CellIsRule(operator='greaterThan', formula=['0.3'],
-                          fill=PatternFill(start_color='FFF2CC', end_color='FFF2CC')))
-        
-        # 자동 필터 추가
-        ws.auto_filter.ref = f'A1:K{len(df)+1}'
-        
-        # 첫 행 고정
-        ws.freeze_panes = 'A2'
-        
-        # 열 너비 자동 조정
-        for column in ws.columns:
-            max_length = 0
-            column_letter = column[0].column_letter
-            for cell in column:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = min(max_length + 2, 50)
-            ws.column_dimensions[column_letter].width = adjusted_width
-    
-    def _create_trace_analysis_sheet(self, wb: Workbook, trace_results: List[Dict[str, Any]], 
-                                   tkprof_results: List[Dict[str, Any]]):
-        """트레이스 분석 시트 생성"""
-        ws = wb.create_sheet("트레이스 분석")
-        
-        if not trace_results:
-            ws['A1'] = '트레이스 분석 결과가 없습니다.'
-            return
-        
-        # tkprof 결과를 SQL_ID별로 매핑
-        tkprof_by_sql = {}
-        for tkprof in tkprof_results:
-            sql_id = tkprof.get('sql_id')
-            if sql_id:
-                tkprof_by_sql[sql_id] = tkprof
-        
-        # 데이터프레임 생성
-        df_data = []
-        for trace in trace_results:
-            sql_id = trace.get('sql_id', '')
-            tkprof_data = tkprof_by_sql.get(sql_id, {}).get('parsed_data', {})
-            
-            # tkprof 통계에서 주요 정보 추출
-            total_calls = 0
-            total_elapsed = 0
-            total_cpu = 0
-            total_disk = 0
-            
-            if tkprof_data.get('sql_statements'):
-                for stmt in tkprof_data['sql_statements']:
-                    total_calls += stmt.get('execute_count', 0)
-                    total_elapsed += stmt.get('total_elapsed', 0)
-                    total_cpu += stmt.get('cpu_time', 0)
-                    total_disk += stmt.get('disk_reads', 0)
-            
-            df_data.append({
-                'SQL_ID': sql_id,
-                '트레이스 파일': os.path.basename(trace.get('trace_file', '')),
-                '수집 시간': trace.get('collection_time', '').strftime('%Y-%m-%d %H:%M:%S') if trace.get('collection_time') else '',
-                'tkprof 분석': 'Y' if sql_id in tkprof_by_sql else 'N',
-                '총 실행 횟수': total_calls,
-                '총 경과시간(초)': round(total_elapsed, 2),
-                '총 CPU시간(초)': round(total_cpu, 2),
-                '총 디스크 읽기': total_disk,
-                '평균 실행시간(ms)': round((total_elapsed * 1000) / max(total_calls, 1), 2),
-                'CPU 사용률(%)': round((total_cpu / max(total_elapsed, 0.001)) * 100, 1),
-                '주요 이슈': self._extract_trace_issues(tkprof_data)
-            })
-        
-        df = pd.DataFrame(df_data)
-        
-        # 데이터프레임을 시트에 추가
-        for r in dataframe_to_rows(df, index=False, header=True):
-            ws.append(r)
-        
-        # 헤더 스타일 적용
-        for cell in ws[1]:
-            cell.font = self.header_font
-            cell.fill = self.header_fill
-            cell.alignment = self.header_alignment
-            cell.border = self.border_thin
-        
-        # 데이터 셀 스타일 적용
-        for row in ws.iter_rows(min_row=2, max_row=len(df)+1):
-            for cell in row:
-                cell.border = self.border_thin
-        
-        # 조건부 서식
-        if len(df) > 0:
-            # CPU 사용률 기준
-            cpu_range = f'J2:J{len(df)+1}'
-            ws.conditional_formatting.add(cpu_range,
-                CellIsRule(operator='greaterThan', formula=['80'],
-                          fill=PatternFill(start_color='FFD7D7', end_color='FFD7D7')))
-        
-        # 자동 필터 및 고정창
-        ws.auto_filter.ref = f'A1:K{len(df)+1}'
-        ws.freeze_panes = 'A2'
-        
-        # 열 너비 조정
-        for column in ws.columns:
-            max_length = 0
-            column_letter = column[0].column_letter
-            for cell in column:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = min(max_length + 2, 40)
-            ws.column_dimensions[column_letter].width = adjusted_width
-    
-    def _create_optimizer_decisions_sheet(self, wb: Workbook, optimizer_results: List[Dict[str, Any]]):
-        """옵티마이저 결정 시트 생성 (10053 분석)"""
-        ws = wb.create_sheet("옵티마이저 결정")
-        
-        if not optimizer_results:
-            ws['A1'] = '10053 옵티마이저 분석 결과가 없습니다.'
-            ws['A3'] = '분석된 SQL이 없습니다. main.py run --with-10053 옵션을 사용하여 10053 트레이스를 수집하세요.'
-            return
-        
-        # 1. 요약 정보
-        ws['A1'] = '10053 옵티마이저 분석 요약'
-        ws['A1'].font = Font(size=14, bold=True, color="2F5597")
-        ws.merge_cells('A1:F1')
-        
-        # 요약 통계
-        total_analyzed = len(optimizer_results)
-        total_issues = sum(len(result.get('parsed_data', {}).get('issues', [])) for result in optimizer_results)
-        
-        cost_differences = []
-        high_cost_diff_count = 0
-        
-        for result in optimizer_results:
-            cost_analysis = result.get('parsed_data', {}).get('cost_analysis', {})
-            if cost_analysis.get('cost_difference_pct'):
-                diff = cost_analysis['cost_difference_pct']
-                cost_differences.append(diff)
-                if diff > 50:
-                    high_cost_diff_count += 1
-        
-        avg_cost_diff = sum(cost_differences) / len(cost_differences) if cost_differences else 0
-        
-        # 요약 데이터 입력
-        summary_data = [
-            ['항목', '값', '단위', '상태', '설명'],
-            ['분석 완료 SQL', total_analyzed, '개', '✓', '10053 트레이스 분석 완료'],
-            ['발견된 총 이슈', total_issues, '개', '⚠️' if total_issues > 5 else '✓', '옵티마이저 관련 이슈'],
-            ['평균 비용 차이', f'{avg_cost_diff:.1f}', '%', '⚠️' if avg_cost_diff > 30 else '✓', '1st vs 2nd 조인 순서'],
-            ['고비용 차이 SQL (>50%)', high_cost_diff_count, '개', '⚠️' if high_cost_diff_count > 0 else '✓', '통계 갱신 필요 가능성']
-        ]
-        
-        for row_idx, row_data in enumerate(summary_data, start=3):
-            for col_idx, value in enumerate(row_data, start=1):
-                cell = ws.cell(row=row_idx, column=col_idx, value=value)
-                if row_idx == 3:  # 헤더 행
-                    cell.font = self.header_font
-                    cell.fill = self.header_fill
-                    cell.alignment = self.header_alignment
-                cell.border = self.border_thin
-        
-        # 2. 상세 분석 결과
-        ws['A9'] = '개별 SQL 분석 결과'
-        ws['A9'].font = Font(size=12, bold=True, color="2F5597")
-        ws.merge_cells('A9:L9')
-        
-        # 개별 분석 데이터
-        detail_data = []
-        for result in optimizer_results:
-            sql_id = result.get('sql_id', '')
-            parsed_data = result.get('parsed_data', {})
-            
-            # 이슈 요약
-            issues = parsed_data.get('issues', [])
-            issue_summary = '; '.join([issue['type'] for issue in issues[:3]])  # 상위 3개
-            
-            # 테이블 정보
-            base_stats = parsed_data.get('base_statistics', {})
-            table_count = len(base_stats)
-            total_rows = sum(stats.get('rows', 0) for stats in base_stats.values())
-            
-            # 조인 분석
-            join_orders = parsed_data.get('join_orders', [])
-            best_join = parsed_data.get('best_join_order', {})
-            
-            # 비용 분석
-            cost_analysis = parsed_data.get('cost_analysis', {})
-            
-            detail_data.append({
-                'SQL_ID': sql_id,
-                '분석시간': result.get('analysis_time', '').strftime('%m-%d %H:%M') if result.get('analysis_time') else '',
-                '이슈수': len(issues),
-                '주요이슈': issue_summary[:50] + '...' if len(issue_summary) > 50 else issue_summary,
-                '테이블수': table_count,
-                '총행수': f'{total_rows:,}' if total_rows > 0 else '0',
-                '조인순서후보': len(join_orders),
-                '최적비용': f"{best_join.get('cost', 0):,}",
-                '비용차이(%)': f"{cost_analysis.get('cost_difference_pct', 0):.1f}",
-                '상태': '⚠️' if len(issues) > 2 or cost_analysis.get('cost_difference_pct', 0) > 30 else '✓',
-                '리포트': os.path.basename(result.get('html_report', '')) if result.get('html_report') else '',
-                '권장조치': self._get_optimizer_recommendation(issues, cost_analysis)
-            })
-        
-        df_detail = pd.DataFrame(detail_data)
-        
-        # 상세 데이터 추가
-        for r in dataframe_to_rows(df_detail, index=False, header=True):
-            ws.append(r)
-        
-        # 상세 데이터 헤더 스타일
-        header_row = len(summary_data) + 4  # 요약 + 제목 + 여백
-        for cell in ws[header_row]:
-            cell.font = self.header_font
-            cell.fill = PatternFill(start_color="70AD47", end_color="70AD47", fill_type="solid")
-            cell.alignment = self.header_alignment
-            cell.border = self.border_thin
-        
-        # 상세 데이터 셀 스타일
-        for row in ws.iter_rows(min_row=header_row+1, max_row=header_row+len(df_detail)):
-            for cell in row:
-                cell.border = self.border_thin
-        
-        # 조건부 서식
-        if len(df_detail) > 0:
-            # 비용 차이 기준
-            cost_diff_range = f'I{header_row+1}:I{header_row+len(df_detail)}'
-            ws.conditional_formatting.add(cost_diff_range,
-                CellIsRule(operator='greaterThan', formula=['30'],
-                          fill=PatternFill(start_color='FFD7D7', end_color='FFD7D7')))
-            
-            # 이슈 수 기준
-            issue_range = f'C{header_row+1}:C{header_row+len(df_detail)}'
-            ws.conditional_formatting.add(issue_range,
-                CellIsRule(operator='greaterThan', formula=['2'],
-                          fill=PatternFill(start_color='FFF2CC', end_color='FFF2CC')))
-        
-        # 3. 이슈 유형별 통계
-        if total_issues > 0:
-            ws[f'A{header_row + len(df_detail) + 3}'] = '이슈 유형별 분포'
-            ws[f'A{header_row + len(df_detail) + 3}'].font = Font(size=12, bold=True, color="2F5597")
-            
-            # 이슈 유형 집계
-            issue_types = {}
-            for result in optimizer_results:
-                for issue in result.get('parsed_data', {}).get('issues', []):
-                    issue_type = issue['type']
-                    if issue_type not in issue_types:
-                        issue_types[issue_type] = 0
-                    issue_types[issue_type] += 1
-            
-            issue_stats_data = [['이슈 유형', '발생 횟수', '비율(%)', '권장 조치']]
-            for issue_type, count in sorted(issue_types.items(), key=lambda x: x[1], reverse=True):
-                percentage = (count / total_analyzed) * 100
-                recommendation = self._get_issue_type_recommendation(issue_type)
-                issue_stats_data.append([issue_type, count, f'{percentage:.1f}', recommendation])
-            
-            # 이슈 통계 데이터 추가
-            issue_start_row = header_row + len(df_detail) + 5
-            for row_idx, row_data in enumerate(issue_stats_data, start=issue_start_row):
-                for col_idx, value in enumerate(row_data, start=1):
-                    cell = ws.cell(row=row_idx, column=col_idx, value=value)
-                    if row_idx == issue_start_row:  # 헤더 행
-                        cell.font = self.header_font
-                        cell.fill = PatternFill(start_color="E7E6E6", end_color="E7E6E6", fill_type="solid")
-                        cell.alignment = self.header_alignment
-                    cell.border = self.border_thin
-        
-        # 자동 필터
-        ws.auto_filter.ref = f'A{header_row}:L{header_row+len(df_detail)}'
-        
-        # 첫 행 고정
-        ws.freeze_panes = f'A{header_row+1}'
-        
-        # 열 너비 조정
-        column_widths = [12, 12, 8, 25, 8, 12, 12, 12, 12, 8, 20, 30]
-        for i, width in enumerate(column_widths, start=1):
-            ws.column_dimensions[chr(64 + i)].width = width
-    
-    def _create_recommendations_sheet(self, wb: Workbook, all_results: Dict[str, Any]):
-        """권고사항 시트 생성"""
-        ws = wb.create_sheet("개선 권고사항")
-        
-        # 권고사항 생성 (ReportGenerator에서 로직 재사용)
+            print(f"  오류: {f.name} - {e}")
+    return data
+
+
+def load_tkprof_jsons(path_pattern):
+    """tkprof JSON 파일 로드"""
+    p = Path(path_pattern)
+    files = []
+    if p.is_dir():
+        files = sorted(p.glob("*_tkprof_*.json"))
+    elif p.is_file():
+        files = [p]
+    else:
+        files = sorted(Path(p.parent).glob(p.name))
+
+    data = []
+    for f in files:
         try:
-            from python.report_generator import ReportGenerator
-            temp_generator = ReportGenerator(self.config, self.logger)
-            report_data = temp_generator._prepare_report_data(all_results)
-            recommendations = report_data.get('recommendations', [])
-        except:
-            recommendations = []
-        
-        if not recommendations:
-            ws['A1'] = '생성된 권고사항이 없습니다.'
-            return
-        
+            with open(f, encoding="utf-8") as fp:
+                data.append(json.load(fp))
+            print(f"  로드(tkprof): {f.name}")
+        except Exception as e:
+            print(f"  오류: {f.name} - {e}")
+    return data
+
+
+def write_tkprof_full(ws, tkprof_data):
+    """📄 tkprof 원문 시트"""
+    ws.title = "📄 tkprof 원문"
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 130
+
+    row = 1
+    for d in tkprof_data:
+        sql_id   = d.get("sql_id", "")
+        trc_file = d.get("trc_file", "")
+        full_text = d.get("tkprof_full_text", "")
+        if not full_text:
+            continue
+
         # 헤더
-        ws['A1'] = 'SQL 튜닝 개선 권고사항'
-        ws['A1'].font = Font(size=14, bold=True, color="2F5597")
-        ws.merge_cells('A1:F1')
-        
-        # 권고사항 데이터
-        rec_data = []
-        for idx, rec in enumerate(recommendations, 1):
-            actions_text = '; '.join(rec.get('actions', []))
-            rec_data.append({
-                '순위': idx,
-                '우선순위': rec.get('priority', ''),
-                '카테고리': rec.get('category', ''),
-                '제목': rec.get('title', ''),
-                '설명': rec.get('description', ''),
-                '권장조치': actions_text
-            })
-        
-        df_rec = pd.DataFrame(rec_data)
-        
-        # 데이터 추가 (헤더 포함)
-        for r in dataframe_to_rows(df_rec, index=False, header=True):
-            ws.append(r)
-        
-        # 헤더 스타일
-        for cell in ws[3]:  # 헤더는 3번째 행
-            cell.font = self.header_font
-            cell.fill = self.header_fill
-            cell.alignment = self.header_alignment
-            cell.border = self.border_thin
-        
-        # 데이터 스타일
-        for row in ws.iter_rows(min_row=4, max_row=3+len(df_rec)):
-            for cell in row:
-                cell.border = self.border_thin
-        
-        # 우선순위별 색상 조건부 서식
-        priority_range = f'B4:B{3+len(df_rec)}'
-        
-        # HIGH - 빨강
-        ws.conditional_formatting.add(priority_range,
-            CellIsRule(operator='equal', formula=['"HIGH"'],
-                      fill=PatternFill(start_color='FFD7D7', end_color='FFD7D7')))
-        
-        # MEDIUM - 노랑  
-        ws.conditional_formatting.add(priority_range,
-            CellIsRule(operator='equal', formula=['"MEDIUM"'],
-                      fill=PatternFill(start_color='FFF2CC', end_color='FFF2CC')))
-        
-        # LOW - 초록
-        ws.conditional_formatting.add(priority_range,
-            CellIsRule(operator='equal', formula=['"LOW"'],
-                      fill=PatternFill(start_color='D5E8D4', end_color='D5E8D4')))
-        
-        # 자동 필터
-        ws.auto_filter.ref = f'A3:F{3+len(df_rec)}'
-        
-        # 첫 행 고정
-        ws.freeze_panes = 'A4'
-        
-        # 열 너비 조정
-        ws.column_dimensions['A'].width = 8
-        ws.column_dimensions['B'].width = 12
-        ws.column_dimensions['C'].width = 15
-        ws.column_dimensions['D'].width = 30
-        ws.column_dimensions['E'].width = 40
-        ws.column_dimensions['F'].width = 50
-    
-    def _extract_trace_issues(self, tkprof_data: Dict[str, Any]) -> str:
-        """tkprof 데이터에서 주요 이슈 추출"""
-        issues = []
-        
-        if not tkprof_data.get('sql_statements'):
-            return '분석 데이터 없음'
-        
-        for stmt in tkprof_data['sql_statements']:
-            parse_count = stmt.get('parse_count', 0)
-            execute_count = stmt.get('execute_count', 0)
-            
-            if execute_count > 0:
-                parse_ratio = parse_count / execute_count
-                if parse_ratio > 0.3:
-                    issues.append('높은 파싱 비율')
-            
-            if stmt.get('rows_per_fetch', 0) > 1000:
-                issues.append('비효율적 Fetch')
-            
-            if stmt.get('cpu_time', 0) > 10:
-                issues.append('높은 CPU 사용')
-        
-        return '; '.join(list(set(issues))) if issues else '정상'
-    
-    def _get_optimizer_recommendation(self, issues: List[Dict[str, Any]], 
-                                    cost_analysis: Dict[str, Any]) -> str:
-        """옵티마이저 분석 결과에 따른 권장 조치"""
-        recommendations = []
-        
-        # 이슈별 권장사항
-        for issue in issues:
-            issue_type = issue.get('type', '')
-            if issue_type == 'COST_DIFFERENCE':
-                recommendations.append('통계갱신')
-            elif issue_type == 'FULL_TABLE_SCAN':
-                recommendations.append('인덱스검토')
-            elif issue_type == 'STALE_STATISTICS':
-                recommendations.append('통계수집')
-        
-        # 비용 차이 기반 권장사항
-        cost_diff = cost_analysis.get('cost_difference_pct', 0)
-        if cost_diff > 50:
-            recommendations.append('힌트사용검토')
-        elif cost_diff > 30:
-            recommendations.append('통계확인')
-        
-        if not recommendations:
-            recommendations.append('현재상태양호')
-        
-        return '; '.join(list(set(recommendations)))
-    
-    def _get_issue_type_recommendation(self, issue_type: str) -> str:
-        """이슈 유형별 권장 조치"""
-        recommendations = {
-            'COST_DIFFERENCE': '테이블 통계 갱신, 조인 힌트 검토',
-            'FULL_TABLE_SCAN': '인덱스 선택성 분석, 파티셔닝 고려',
-            'STALE_STATISTICS': 'DBMS_STATS 실행, 자동 통계 설정',
-            'HIGH_CPU': '인덱스 추가, SQL 재작성',
-            'CARDINALITY_ERROR': '히스토그램 수집, 통계 정확성 확인'
+        c = ws.cell(row=row, column=1, value=f"  SQL_ID: {sql_id}  |  TRC: {Path(trc_file).name}")
+        c.font = SUB_HEADER_FONT
+        c.fill = SUB_HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[row].height = 22
+        row += 1
+
+        # tkprof 전체 텍스트
+        line_count = full_text.count("\n") + 1
+        c = ws.cell(row=row, column=1, value=full_text)
+        c.font = Font(name="Consolas", size=9, color="000000")
+        c.fill = PatternFill("solid", start_color="FFFFFF")
+        c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        c.border = Border(
+            left=Side(style="dashed", color="00AA00"),
+            right=Side(style="dashed", color="00AA00"),
+            top=Side(style="dashed", color="00AA00"),
+            bottom=Side(style="dashed", color="00AA00"),
+        )
+        ws.row_dimensions[row].height = line_count * 14
+        row += 3
+
+
+def write_parse_exec_fetch(ws, tkprof_data):
+    """⏱ Parse/Execute/Fetch 통계 시트"""
+    ws.title = "⏱ Parse-Exec-Fetch"
+    ws.sheet_view.showGridLines = False
+
+    headers = ["SQL_ID", "SQL 텍스트(요약)", "Phase",
+               "Count", "CPU(s)", "Elapsed(s)", "Disk", "Query", "Current", "Rows"]
+    widths  = [20, 45, 10, 8, 10, 10, 10, 10, 10, 10]
+    for ci, (h, w) in enumerate(zip(headers, widths), 1):
+        hcell(ws, 1, ci, h, w)
+    ws.row_dimensions[1].height = 22
+    freeze(ws, "A2")
+
+    row = 2
+    PHASE_FILL = {
+        "Parse":   PatternFill("solid", start_color="EBF3FB"),
+        "Execute": PatternFill("solid", start_color="E2EFDA"),
+        "Fetch":   PatternFill("solid", start_color="FFF2CC"),
+        "Total":   PatternFill("solid", start_color="F2F2F2"),
+    }
+
+    for d in tkprof_data:
+        sql_id = d.get("sql_id", "")
+        for stmt in d.get("tkprof_statements", []):
+            sql_preview = (stmt.get("sql_text") or "")[:80].replace("\n", " ")
+            phases = [
+                ("Parse",   stmt.get("parse_count"),   stmt.get("parse_cpu"),   stmt.get("parse_elapsed"),
+                            stmt.get("parse_disk"),    stmt.get("parse_query"),  stmt.get("parse_current"), stmt.get("parse_rows")),
+                ("Execute", stmt.get("execute_count"), stmt.get("execute_cpu"), stmt.get("execute_elapsed"),
+                            stmt.get("execute_disk"),  stmt.get("execute_query"),stmt.get("execute_current"),stmt.get("execute_rows")),
+                ("Fetch",   stmt.get("fetch_count"),   stmt.get("fetch_cpu"),   stmt.get("fetch_elapsed"),
+                            stmt.get("fetch_disk"),    stmt.get("fetch_query"),  stmt.get("fetch_current"), stmt.get("fetch_rows")),
+                ("Total",   "",                        stmt.get("total_cpu"),   stmt.get("total_elapsed"),
+                            stmt.get("total_disk"),    stmt.get("total_query"),  stmt.get("total_current"), stmt.get("total_rows")),
+            ]
+            for phase, count, cpu, elapsed, disk, query, current, rows in phases:
+                fill = PHASE_FILL.get(phase)
+                scell(ws, row, 1, sql_id,       mono=True, fill=fill)
+                scell(ws, row, 2, sql_preview,  fill=fill, wrap=True)
+                scell(ws, row, 3, phase,        bold=True, fill=fill, align="center")
+                scell(ws, row, 4, count,        fill=fill, align="right")
+                scell(ws, row, 5, cpu,          fill=fill, align="right")
+                scell(ws, row, 6, elapsed,      fill=fill, align="right")
+                scell(ws, row, 7, disk,         fill=fill, align="right")
+                scell(ws, row, 8, query,        fill=fill, align="right")
+                scell(ws, row, 9, current,      fill=fill, align="right")
+                scell(ws, row, 10, rows,        fill=fill, align="right")
+                ws.row_dimensions[row].height = 16
+                row += 1
+            row += 1  # stmt 간 여백
+
+
+def write_wait_events(ws, tkprof_data):
+    """⏳ 대기 이벤트 시트"""
+    ws.title = "⏳ 대기 이벤트"
+    ws.sheet_view.showGridLines = False
+
+    headers = ["SQL_ID", "Wait Event", "대기 횟수", "최대 대기(s)"]
+    widths  = [20, 55, 14, 14]
+    for ci, (h, w) in enumerate(zip(headers, widths), 1):
+        hcell(ws, 1, ci, h, w)
+    ws.row_dimensions[1].height = 22
+    freeze(ws, "A2")
+
+    row = 2
+    for d in tkprof_data:
+        sql_id = d.get("sql_id", "")
+        for stmt in d.get("tkprof_statements", []):
+            for w_ev in stmt.get("wait_events", []):
+                times = w_ev.get("times_waited", 0)
+                max_w = float(w_ev.get("max_wait", 0))
+                fill = DANGER_FILL if max_w > 1 else (WARN_FILL if max_w > 0.1 else (ALT_FILL if row % 2 == 0 else None))
+                scell(ws, row, 1, sql_id,                   mono=True, fill=fill)
+                scell(ws, row, 2, w_ev.get("event", ""),    fill=fill)
+                scell(ws, row, 3, times,                    fill=fill, align="right")
+                scell(ws, row, 4, max_w,                    fill=fill, align="right")
+                ws.row_dimensions[row].height = 16
+                row += 1
+
+
+def write_bind_variables(ws, tkprof_data):
+    """🔖 바인드 변수 시트"""
+    ws.title = "🔖 바인드 변수"
+    ws.sheet_view.showGridLines = False
+
+    headers = ["SQL_ID", "SQL 텍스트(요약)", "위치(Position)", "타입", "값"]
+    widths  = [20, 45, 14, 14, 40]
+    for ci, (h, w) in enumerate(zip(headers, widths), 1):
+        hcell(ws, 1, ci, h, w)
+    ws.row_dimensions[1].height = 22
+    freeze(ws, "A2")
+
+    row = 2
+    for d in tkprof_data:
+        sql_id = d.get("sql_id", "")
+        for stmt in d.get("tkprof_statements", []):
+            sql_preview = (stmt.get("sql_text") or "")[:80].replace("\n", " ")
+            binds = stmt.get("bind_variables", [])
+            if not binds:
+                continue
+            for b in binds:
+                fill = ALT_FILL if row % 2 == 0 else None
+                scell(ws, row, 1, sql_id,                    mono=True, fill=fill)
+                scell(ws, row, 2, sql_preview,               fill=fill, wrap=True)
+                scell(ws, row, 3, b.get("position", ""),     fill=fill, align="center")
+                scell(ws, row, 4, b.get("type", ""),         fill=fill, align="center")
+                scell(ws, row, 5, b.get("value", ""),        mono=True, fill=fill)
+                ws.row_dimensions[row].height = 16
+                row += 1
+
+
+def load_detected_jsons(path_pattern):
+    """Phase1 감지 결과 JSON 로드"""
+    p = Path(path_pattern)
+    files = sorted(p.parent.glob(p.name)) if not p.is_dir() else sorted(p.glob("detected_*.json"))
+    detected = []
+    for f in files:
+        try:
+            with open(f, encoding="utf-8") as fp:
+                d = json.load(fp)
+                sql_list = d.get("sql_list", [])
+                detected_at = d.get("detected_at", "")
+                for s in sql_list:
+                    s["detected_at"] = detected_at
+                detected.extend(sql_list)
+        except Exception as e:
+            print(f"  오류: {f.name} - {e}")
+    return detected
+
+
+# ============================================
+# Sheet: 10053 Optimizer Trace
+# ============================================
+def load_10053_data(trace_dir):
+    """10053 트레이스 파일을 파싱하여 데이터 로드"""
+    import types
+    trace_path = Path(trace_dir)
+    trc_files = sorted(trace_path.glob("10053_*.trc"))
+    if not trc_files:
+        return []
+
+    # optimizer_trace 모듈 로드 (DB 의존성 없이)
+    ot_path = Path(__file__).parent / "optimizer_trace.py"
+    if not ot_path.exists():
+        print(f"  optimizer_trace.py 없음: {ot_path}")
+        return []
+
+    code = ot_path.read_text(encoding="utf-8")
+    code = code.replace("import oracledb", "# import oracledb")
+    code = code.replace("from trace_collector import SSHClient", "# skip")
+    code = code.replace("from utils import get_oracle_connection, load_config", "def load_config(): return {}")
+    mod = types.ModuleType("optimizer_trace")
+    exec(compile(code, str(ot_path), "exec"), mod.__dict__)
+
+    results = []
+    for f in trc_files:
+        try:
+            analyzer = mod.OptimizerTraceAnalyzer()
+            parsed = analyzer.parse_10053(str(f))
+            results.append(parsed)
+            print(f"  10053 로드: {f.name} (SQL_ID: {parsed.get('sql_id', '?')})")
+        except Exception as e:
+            print(f"  10053 오류: {f.name} - {e}")
+    return results
+
+
+def write_10053_summary(ws, data_list):
+    """🔬 10053 요약 시트"""
+    ws.title = "🔬 10053 요약"
+    ws.sheet_view.showGridLines = False
+    ws.row_dimensions[1].height = 40
+
+    ws.merge_cells("A1:J1")
+    c = ws["A1"]
+    c.value = "10053 Optimizer Trace Analysis"
+    c.font = TITLE_FONT
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    c.fill = PatternFill("solid", start_color="EBF3FB")
+
+    ws.merge_cells("A2:J2")
+    ws["A2"].value = f"생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  분석 SQL 수: {len(data_list)}건"
+    ws["A2"].font = Font(name="Arial", size=10, italic=True, color="595959")
+    ws["A2"].alignment = Alignment(horizontal="center")
+
+    headers = ["SQL_ID", "SQL 텍스트 (요약)", "테이블", "행 수", "최적 경로",
+               "최적 인덱스", "최적 비용", "총 비용", "이슈 수", "인스턴스"]
+    widths  = [18, 50, 22, 16, 18, 22, 16, 16, 10, 14]
+    for i, (h, w) in enumerate(zip(headers, widths), 1):
+        hcell(ws, 3, i, h, w)
+    ws.row_dimensions[3].height = 22
+    freeze(ws, "A4")
+
+    for r, d in enumerate(data_list, 4):
+        fill = ALT_FILL if r % 2 == 0 else None
+        sql_preview = (d.get("sql_text") or "")[:80].replace("\n", " ")
+
+        # 테이블 정보
+        tables = list(d.get("base_statistics", {}).keys())
+        table_name = tables[0] if tables else ""
+        table_rows = d.get("base_statistics", {}).get(table_name, {}).get("rows", 0)
+
+        # 최적 경로
+        best_method = ""
+        best_index = ""
+        best_cost = 0
+        if d.get("table_access_paths"):
+            best = d["table_access_paths"][0].get("best_access", {})
+            best_method = best.get("method", "")
+            best_index = best.get("index", "") or ""
+            best_cost = best.get("cost", 0)
+
+        total_cost = d.get("best_join_order", {}).get("cost", 0)
+        issue_count = len(d.get("issues", []))
+
+        scell(ws, r, 1, d.get("sql_id", ""), mono=True, fill=fill)
+        scell(ws, r, 2, sql_preview, fill=fill, wrap=True)
+        scell(ws, r, 3, table_name, fill=fill)
+        scell(ws, r, 4, f"{table_rows:,}" if table_rows else "", align="right", fill=fill)
+        scell(ws, r, 5, best_method, fill=fill, align="center")
+        scell(ws, r, 6, best_index, fill=fill)
+        scell(ws, r, 7, f"{best_cost:,.2f}" if best_cost else "", align="right", fill=fill)
+        scell(ws, r, 8, f"{total_cost:,.2f}" if total_cost else "", align="right", fill=fill)
+        issue_fill = DANGER_FILL if issue_count > 2 else (WARN_FILL if issue_count > 0 else fill)
+        scell(ws, r, 9, issue_count, align="center", fill=issue_fill)
+        scell(ws, r, 10, d.get("db_info", {}).get("instance_name", ""), fill=fill, align="center")
+        ws.row_dimensions[r].height = 18
+
+
+def write_10053_access_paths(ws, data_list):
+    """🛤 접근 경로 시트"""
+    ws.title = "🛤 접근 경로"
+    ws.sheet_view.showGridLines = False
+
+    headers = ["SQL_ID", "테이블", "접근 방법", "인덱스", "비용(Cost)",
+               "응답시간(Resp)", "병렬도", "최적 여부", "비용 비율"]
+    widths  = [18, 22, 25, 22, 16, 16, 10, 12, 12]
+    for i, (h, w) in enumerate(zip(headers, widths), 1):
+        hcell(ws, 1, i, h, w)
+    ws.row_dimensions[1].height = 22
+    freeze(ws, "A2")
+
+    row = 2
+    for d in data_list:
+        sql_id = d.get("sql_id", "")
+        for path in d.get("table_access_paths", []):
+            table_name = path.get("table_name", "")
+            best = path.get("best_access", {})
+            best_cost = best.get("cost", 0) if best else 0
+            methods = sorted(path.get("access_methods", []), key=lambda x: x.get("cost", float("inf")))
+
+            for i, m in enumerate(methods):
+                is_best = (i == 0)
+                cost = m.get("cost", 0)
+                ratio = cost / best_cost if best_cost > 0 else 0
+                row_fill = GOOD_FILL if is_best else (DANGER_FILL if ratio > 5 else None)
+
+                scell(ws, row, 1, sql_id, mono=True, fill=row_fill)
+                scell(ws, row, 2, table_name, fill=row_fill)
+                scell(ws, row, 3, m.get("method", ""), fill=row_fill)
+                scell(ws, row, 4, m.get("index", "") or "-", fill=row_fill)
+                scell(ws, row, 5, f"{cost:,.2f}", align="right", fill=row_fill)
+                scell(ws, row, 6, f"{m.get('response_time', 0):,.2f}", align="right", fill=row_fill)
+                scell(ws, row, 7, m.get("degree", ""), align="center", fill=row_fill)
+                scell(ws, row, 8, "✅ 최적" if is_best else "", align="center", fill=row_fill)
+                scell(ws, row, 9, f"{ratio:.1f}x" if not is_best else "1.0x", align="center", fill=row_fill)
+                ws.row_dimensions[row].height = 16
+                row += 1
+
+            row += 1  # 테이블 간 여백
+
+
+def write_10053_stats(ws, data_list):
+    """📊 테이블/인덱스/컬럼 통계 시트"""
+    ws.title = "📊 10053 통계"
+    ws.sheet_view.showGridLines = False
+
+    row = 1
+
+    for d in data_list:
+        sql_id = d.get("sql_id", "")
+
+        # SQL ID 헤더
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=10)
+        c = ws.cell(row=row, column=1, value=f"  SQL_ID: {sql_id}")
+        c.font = SUB_HEADER_FONT
+        c.fill = SUB_HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[row].height = 22
+        row += 1
+
+        # ── 시스템 통계 ──
+        sys_stats = d.get("system_statistics", {})
+        if sys_stats:
+            c = ws.cell(row=row, column=1, value="⚡ 시스템 통계")
+            c.font = LABEL_FONT
+            row += 1
+            sys_headers = ["항목", "값", "단위", "기본값", "기본값 여부"]
+            for ci, h in enumerate(sys_headers, 1):
+                hcell(ws, row, ci, h, [14, 14, 30, 14, 14][ci-1])
+            row += 1
+            for name, info in sys_stats.items():
+                if name == "stats_type" or not isinstance(info, dict):
+                    continue
+                fill = WARN_FILL if info.get("is_default") else None
+                scell(ws, row, 1, name, bold=True, fill=fill)
+                scell(ws, row, 2, info.get("value", ""), align="right", fill=fill)
+                scell(ws, row, 3, info.get("unit", ""), fill=fill)
+                scell(ws, row, 4, info.get("default", ""), align="right", fill=fill)
+                scell(ws, row, 5, "기본값" if info.get("is_default") else "커스텀", align="center", fill=fill)
+                ws.row_dimensions[row].height = 16
+                row += 1
+            row += 1
+
+        # ── 테이블 통계 ──
+        base_stats = d.get("base_statistics", {})
+        if base_stats:
+            c = ws.cell(row=row, column=1, value="📋 테이블 통계")
+            c.font = LABEL_FONT
+            row += 1
+            tbl_headers = ["테이블", "별칭", "행 수", "블록 수", "평균 행 길이", "예상 크기(MB)"]
+            for ci, h in enumerate(tbl_headers, 1):
+                hcell(ws, row, ci, h, [22, 22, 16, 14, 14, 14][ci-1])
+            row += 1
+            for tbl, stats in base_stats.items():
+                size_mb = (stats["blocks"] * 8192) / (1024 * 1024)
+                scell(ws, row, 1, tbl, bold=True)
+                scell(ws, row, 2, stats["alias"])
+                scell(ws, row, 3, f"{stats['rows']:,}", align="right")
+                scell(ws, row, 4, f"{stats['blocks']:,}", align="right")
+                scell(ws, row, 5, stats["avg_row_len"], align="right")
+                scell(ws, row, 6, f"{size_mb:,.1f}", align="right")
+                ws.row_dimensions[row].height = 16
+                row += 1
+            row += 1
+
+        # ── 인덱스 통계 ──
+        idx_stats = d.get("index_statistics", {})
+        if idx_stats:
+            c = ws.cell(row=row, column=1, value="📑 인덱스 통계")
+            c.font = LABEL_FONT
+            row += 1
+            idx_headers = ["인덱스", "컬럼#", "Levels", "Leaf Blocks", "Distinct Keys",
+                          "LB/K", "DB/K", "Clustering Factor", "CF/Rows"]
+            for ci, h in enumerate(idx_headers, 1):
+                hcell(ws, row, ci, h, [22, 10, 8, 14, 14, 8, 8, 18, 10][ci-1])
+            row += 1
+            for idx_name, info in idx_stats.items():
+                cf_ratio = info["clustering_factor"] / info["num_rows"] if info["num_rows"] > 0 else 0
+                fill = DANGER_FILL if cf_ratio > 0.5 else (WARN_FILL if cf_ratio > 0.3 else GOOD_FILL if cf_ratio < 0.1 else None)
+                scell(ws, row, 1, idx_name, bold=True, fill=fill)
+                scell(ws, row, 2, info["columns"], fill=fill)
+                scell(ws, row, 3, info["levels"], align="center", fill=fill)
+                scell(ws, row, 4, f"{info['leaf_blocks']:,}", align="right", fill=fill)
+                scell(ws, row, 5, f"{info['distinct_keys']:,}", align="right", fill=fill)
+                scell(ws, row, 6, f"{info['lb_per_key']:.2f}", align="right", fill=fill)
+                scell(ws, row, 7, f"{info['db_per_key']:.2f}", align="right", fill=fill)
+                scell(ws, row, 8, f"{info['clustering_factor']:,.0f}", align="right", fill=fill)
+                scell(ws, row, 9, f"{cf_ratio:.1%}", align="center", fill=fill)
+                ws.row_dimensions[row].height = 16
+                row += 1
+            row += 1
+
+        # ── 컬럼 통계 ──
+        col_stats = d.get("column_statistics", {})
+        if col_stats:
+            c = ws.cell(row=row, column=1, value="📉 컬럼 통계")
+            c.font = LABEL_FONT
+            row += 1
+            col_headers = ["컬럼", "타입", "NDV", "Nulls", "Density", "AvgLen", "Histogram", "Buckets"]
+            for ci, h in enumerate(col_headers, 1):
+                hcell(ws, row, ci, h, [22, 14, 12, 10, 14, 10, 12, 10][ci-1])
+            row += 1
+            for col_name, info in col_stats.items():
+                hist_fill = GOOD_FILL if info["histogram"] != "None" else WARN_FILL
+                scell(ws, row, 1, col_name, bold=True)
+                scell(ws, row, 2, info["data_type"])
+                scell(ws, row, 3, f"{info['ndv']:,}", align="right")
+                scell(ws, row, 4, f"{info['nulls']:,}", align="right")
+                scell(ws, row, 5, f"{info['density']:.6f}", align="right")
+                scell(ws, row, 6, info["avg_len"], align="right")
+                scell(ws, row, 7, info["histogram"], align="center", fill=hist_fill)
+                scell(ws, row, 8, f"{info['buckets']:,}", align="right")
+                ws.row_dimensions[row].height = 16
+                row += 1
+
+        row += 2  # SQL 간 여백
+
+
+def write_10053_issues(ws, data_list):
+    """⚠ 10053 이슈 시트"""
+    ws.title = "⚠ 10053 이슈"
+    ws.sheet_view.showGridLines = False
+
+    headers = ["SQL_ID", "심각도", "유형", "현상", "권장사항"]
+    widths  = [18, 12, 24, 55, 65]
+    for i, (h, w) in enumerate(zip(headers, widths), 1):
+        hcell(ws, 1, i, h, w)
+    ws.row_dimensions[1].height = 22
+    freeze(ws, "A2")
+
+    SEV_FILL = {
+        "WARNING": WARN_FILL,
+        "INFO": GOOD_FILL,
+        "CRITICAL": DANGER_FILL,
+    }
+    SEV_LABEL = {
+        "WARNING": "🟡 WARNING",
+        "INFO": "🟢 INFO",
+        "CRITICAL": "🔴 CRITICAL",
+    }
+
+    row = 2
+    for d in data_list:
+        sql_id = d.get("sql_id", "")
+        for issue in d.get("issues", []):
+            fill = SEV_FILL.get(issue["severity"], None)
+            scell(ws, row, 1, sql_id, mono=True, fill=fill)
+            scell(ws, row, 2, SEV_LABEL.get(issue["severity"], issue["severity"]), bold=True, fill=fill, align="center")
+            scell(ws, row, 3, issue["type"], bold=True, fill=fill)
+            scell(ws, row, 4, issue["message"], fill=fill, wrap=True)
+            scell(ws, row, 5, issue["recommendation"], fill=fill, wrap=True)
+            ws.row_dimensions[row].height = max(30, issue["recommendation"].count("\n") * 16 + 16)
+            row += 1
+        row += 1
+
+
+def write_10053_params(ws, data_list):
+    """⚙ 옵티마이저 파라미터 시트"""
+    ws.title = "⚙ 옵티마이저 파라미터"
+    ws.sheet_view.showGridLines = False
+
+    row = 1
+    for d in data_list:
+        sql_id = d.get("sql_id", "")
+
+        # SQL ID 헤더
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
+        c = ws.cell(row=row, column=1, value=f"  SQL_ID: {sql_id}")
+        c.font = SUB_HEADER_FONT
+        c.fill = SUB_HEADER_FILL
+        ws.row_dimensions[row].height = 22
+        row += 1
+
+        # 변경된 파라미터
+        altered = d.get("optimizer_parameters_altered", {})
+        if altered:
+            c = ws.cell(row=row, column=1, value="📌 변경된 파라미터 (Altered)")
+            c.font = LABEL_FONT
+            row += 1
+            hcell(ws, row, 1, "파라미터", 45)
+            hcell(ws, row, 2, "값", 30)
+            row += 1
+            for param, value in altered.items():
+                scell(ws, row, 1, param, mono=True, fill=WARN_FILL)
+                scell(ws, row, 2, value, mono=True, fill=WARN_FILL)
+                ws.row_dimensions[row].height = 16
+                row += 1
+            row += 1
+
+        # 주요 기본 파라미터
+        default = d.get("optimizer_parameters_default", {})
+        key_params = {
+            "optimizer_mode", "optimizer_features_enable", "cpu_count", "active_instance_count",
+            "db_file_multiblock_read_count", "pga_aggregate_target", "hash_area_size",
+            "sort_area_size", "cursor_sharing", "star_transformation_enabled",
+            "parallel_threads_per_cpu", "_optimizer_cost_model", "_b_tree_bitmap_plans",
         }
-        
-        return recommendations.get(issue_type, '전문가 검토 필요')
+        key_defaults = {k: v for k, v in default.items() if k in key_params}
+        if key_defaults:
+            c = ws.cell(row=row, column=1, value="📋 주요 기본 파라미터")
+            c.font = LABEL_FONT
+            row += 1
+            hcell(ws, row, 1, "파라미터", 45)
+            hcell(ws, row, 2, "값", 30)
+            row += 1
+            for param, value in key_defaults.items():
+                fill = ALT_FILL if row % 2 == 0 else None
+                scell(ws, row, 1, param, mono=True, fill=fill)
+                scell(ws, row, 2, value, mono=True, fill=fill)
+                ws.row_dimensions[row].height = 16
+                row += 1
+
+        row += 2
+
+
+def main():
+    parser = argparse.ArgumentParser(description="SQL 튜닝 분석 결과 Excel 내보내기")
+    parser.add_argument("--json", type=str, default="./output/traces/",
+                        help="AWR JSON 파일 또는 디렉토리 경로")
+    parser.add_argument("--detected", type=str, default=None,
+                        help="Phase1 감지 결과 JSON 파일 또는 디렉토리")
+    parser.add_argument("--output", type=str, default=None,
+                        help="출력 엑셀 파일 경로")
+    parser.add_argument("--10053", dest="trace_10053", type=str, default=None,
+                        help="10053 트레이스 파일 디렉토리 (예: output/traces/)")
+    parser.add_argument("--config", type=str, default=None)
+    args = parser.parse_args()
+
+    # 출력 경로
+    if args.output:
+        out_path = Path(args.output)
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = Path("./output/reports") / f"sql_tuning_report_{ts}.xlsx"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"AWR JSON 로드 중: {args.json}")
+    json_path    = args.json
+    det_path     = args.detected
+    all_data     = load_awr_jsons(json_path)
+    tkprof_data  = load_tkprof_jsons(json_path if Path(json_path).is_dir() else str(Path(json_path).parent))
+
+    detected_list = []
+    if det_path:
+        print(f"감지 결과 로드 중: {det_path}")
+        detected_list = load_detected_jsons(det_path)
+
+    # 10053 데이터 로드
+    data_10053 = []
+    trace_10053_path = args.trace_10053
+    if not trace_10053_path:
+        # 기본: output/traces/ 에서 자동 탐색
+        default_trace_dir = Path(json_path) if Path(json_path).is_dir() else Path(json_path).parent
+        if list(default_trace_dir.glob("10053_*.trc")):
+            trace_10053_path = str(default_trace_dir)
+    if trace_10053_path:
+        print(f"10053 트레이스 로드 중: {trace_10053_path}")
+        data_10053 = load_10053_data(trace_10053_path)
+
+    if not all_data and not detected_list and not tkprof_data and not data_10053:
+        print("데이터 없음. 종료.")
+        sys.exit(1)
+
+    print(f"\nExcel 생성 중: {out_path}")
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    # 시트 생성
+    ws_summary = wb.create_sheet("📋 요약")
+    ws_plan    = wb.create_sheet("📊 실행계획")
+    ws_awr     = wb.create_sheet("📈 AWR 성능통계")
+    ws_tuning  = wb.create_sheet("💡 튜닝 가이드")
+    ws_detect  = wb.create_sheet("🔍 감지된 느린 SQL")
+    ws_tkprof  = wb.create_sheet("📄 tkprof 원문")
+    ws_pef     = wb.create_sheet("⏱ Parse-Exec-Fetch")
+    ws_wait    = wb.create_sheet("⏳ 대기 이벤트")
+    ws_bind    = wb.create_sheet("🔖 바인드 변수")
+
+    if all_data:
+        write_summary(ws_summary, all_data)
+        write_plans(ws_plan, all_data)
+        write_awr_stats(ws_awr, all_data)
+        write_tuning_guide(ws_tuning, all_data)
+
+    write_detected(ws_detect, detected_list)
+
+    if tkprof_data:
+        write_tkprof_full(ws_tkprof, tkprof_data)
+        write_parse_exec_fetch(ws_pef, tkprof_data)
+        write_wait_events(ws_wait, tkprof_data)
+        write_bind_variables(ws_bind, tkprof_data)
+
+    # 10053 시트
+    if data_10053:
+        ws_10053_sum    = wb.create_sheet("🔬 10053 요약")
+        ws_10053_access = wb.create_sheet("🛤 접근 경로")
+        ws_10053_stats  = wb.create_sheet("📊 10053 통계")
+        ws_10053_issues = wb.create_sheet("⚠ 10053 이슈")
+        ws_10053_params = wb.create_sheet("⚙ 옵티마이저 파라미터")
+        write_10053_summary(ws_10053_sum, data_10053)
+        write_10053_access_paths(ws_10053_access, data_10053)
+        write_10053_stats(ws_10053_stats, data_10053)
+        write_10053_issues(ws_10053_issues, data_10053)
+        write_10053_params(ws_10053_params, data_10053)
+
+    wb.save(str(out_path))
+    print(f"\n[OK] Saved: {out_path}")
+    return str(out_path)
+
+
+if __name__ == "__main__":
+    main()
