@@ -1485,8 +1485,9 @@ def write_10053_access_paths(ws, data_list):
     ws.sheet_view.showGridLines = False
 
     headers = ["SQL_ID", "테이블", "접근 방법", "인덱스", "비용(Cost)",
-               "응답시간(Resp)", "병렬도", "최적 여부", "비용 비율"]
-    widths  = [18, 22, 25, 22, 16, 16, 10, 12, 12]
+               "응답시간(Resp)", "병렬도", "Cost_io", "Cost_cpu", "ix_sel",
+               "최적 여부", "비용 비율"]
+    widths  = [18, 22, 25, 22, 16, 16, 10, 14, 14, 12, 12, 12]
     for i, (h, w) in enumerate(zip(headers, widths), 1):
         hcell(ws, 1, i, h, w)
     ws.row_dimensions[1].height = 22
@@ -1514,8 +1515,14 @@ def write_10053_access_paths(ws, data_list):
                 scell(ws, row, 5, f"{cost:,.2f}", align="right", fill=row_fill)
                 scell(ws, row, 6, f"{m.get('response_time', 0):,.2f}", align="right", fill=row_fill)
                 scell(ws, row, 7, m.get("degree", ""), align="center", fill=row_fill)
-                scell(ws, row, 8, "✅ 최적" if is_best else "", align="center", fill=row_fill)
-                scell(ws, row, 9, f"{ratio:.1f}x" if not is_best else "1.0x", align="center", fill=row_fill)
+                cost_io = m.get("cost_io")
+                cost_cpu = m.get("cost_cpu")
+                ix_sel = m.get("ix_sel")
+                scell(ws, row, 8, f"{cost_io:,.6f}" if cost_io is not None else "-", align="right", fill=row_fill)
+                scell(ws, row, 9, f"{cost_cpu:,}" if cost_cpu is not None else "-", align="right", fill=row_fill)
+                scell(ws, row, 10, f"{ix_sel:.6f}" if ix_sel is not None else "-", align="right", fill=row_fill)
+                scell(ws, row, 11, "✅ 최적" if is_best else "", align="center", fill=row_fill)
+                scell(ws, row, 12, f"{ratio:.1f}x" if not is_best else "1.0x", align="center", fill=row_fill)
                 ws.row_dimensions[row].height = 16
                 row += 1
 
@@ -1624,15 +1631,37 @@ def write_10053_stats(ws, data_list):
                 hcell(ws, row, ci, h, [22, 14, 12, 10, 14, 10, 12, 10][ci-1])
             row += 1
             for col_name, info in col_stats.items():
-                hist_fill = GOOD_FILL if info["histogram"] != "None" else WARN_FILL
+                hist = info.get("histogram", "None")
+                hist_fill = GOOD_FILL if hist not in ("None", "N/A (no stats)") else WARN_FILL
                 scell(ws, row, 1, col_name, bold=True)
                 scell(ws, row, 2, info["data_type"])
                 scell(ws, row, 3, f"{info['ndv']:,}", align="right")
                 scell(ws, row, 4, f"{info['nulls']:,}", align="right")
                 scell(ws, row, 5, f"{info['density']:.6f}", align="right")
                 scell(ws, row, 6, info["avg_len"], align="right")
-                scell(ws, row, 7, info["histogram"], align="center", fill=hist_fill)
+                scell(ws, row, 7, hist, align="center", fill=hist_fill)
                 scell(ws, row, 8, f"{info['buckets']:,}", align="right")
+                ws.row_dimensions[row].height = 16
+                row += 1
+            row += 1
+
+        # ── 쿼리 변환 ──
+        qt_list = d.get("query_transformations", [])
+        if qt_list:
+            c = ws.cell(row=row, column=1, value="🔄 쿼리 변환 (Query Transformations)")
+            c.font = LABEL_FONT
+            row += 1
+            qt_headers = ["유형", "변환명", "상태", "상세"]
+            for ci, h in enumerate(qt_headers, 1):
+                hcell(ws, row, ci, h, [10, 30, 14, 60][ci-1])
+            row += 1
+            for qt in qt_list:
+                status = qt.get("status", "")
+                fill = GOOD_FILL if status == "applied" else (WARN_FILL if status == "bypassed" else None)
+                scell(ws, row, 1, qt.get("type", ""), bold=True, fill=fill)
+                scell(ws, row, 2, qt.get("name", ""), fill=fill)
+                scell(ws, row, 3, status, align="center", fill=fill)
+                scell(ws, row, 4, qt.get("detail", ""), fill=fill, wrap=True)
                 ws.row_dimensions[row].height = 16
                 row += 1
 

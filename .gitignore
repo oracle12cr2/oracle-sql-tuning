@@ -11,3 +11,8 @@ output/traces/*.trc
 output/traces/*.json
 output/tkprof/*.prf
 *.tmp
+fix_*.py
+find_sql.py
+0
+*.svg
+test_*.xlsx

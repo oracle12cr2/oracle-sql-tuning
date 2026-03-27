@@ -82,7 +82,7 @@ trace:
     user: "oracle"         # SSH 접속 사용자
     # 인증 방식: key 또는 password
     auth_method: "key"              # "key" 또는 "password"
-    key_path: "~/.ssh/id_ed25519"   # SSH 개인키 경로 (ed25519)
+    key_path: "C:/Users/kto/.ssh/id_ed25519"   # SSH 개인키 경로 (ed25519)
     password_env: "SSH_PWD"         # password 방식일 때 환경변수명
     # RAC 노드별 SSH (10046/10053 수집 시 접속한 인스턴스의 노드로 연결)
     rac_ssh:

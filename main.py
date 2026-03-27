@@ -234,7 +234,10 @@ def cmd_target(args):
     logger.info(f"출력 폴더: {report_dir}")
     logger.info("=" * 60)
 
-    # XPLAN 실행계획 저장
+    # --- Step 1: DBMS_XPLAN 실행계획 ---
+    logger.info("\n" + "=" * 40)
+    logger.info("Step 1: DBMS_XPLAN 실행계획")
+    logger.info("=" * 40)
     try:
         from utils import get_oracle_connection
         conn = get_oracle_connection(config)
@@ -278,7 +281,7 @@ def cmd_target(args):
     trc_file = None
     if not skip_10046:
         logger.info("\n" + "=" * 40)
-        logger.info("Step 1: 10046 트레이스 수집")
+        logger.info("Step 2: 10046 트레이스 수집")
         logger.info("=" * 40)
         try:
             args.file = None
@@ -304,7 +307,7 @@ def cmd_target(args):
     # --- tkprof 분석 ---
     if trc_file:
         logger.info("\n" + "=" * 40)
-        logger.info("Step 2: tkprof 분석")
+        logger.info("Step 3: tkprof 분석")
         logger.info("=" * 40)
         try:
             args.file = trc_file
@@ -315,7 +318,7 @@ def cmd_target(args):
     # --- 10053 옵티마이저 트레이스 ---
     if not skip_10053:
         logger.info("\n" + "=" * 40)
-        logger.info("Step 3: 10053 옵티마이저 트레이스")
+        logger.info("Step 4: 10053 옵티마이저 트레이스")
         logger.info("=" * 40)
         try:
             from optimizer_trace import OptimizerTraceCollector, OptimizerTraceAnalyzer
@@ -339,7 +342,7 @@ def cmd_target(args):
     # --- Excel 리포트 ---
     if not skip_excel:
         logger.info("\n" + "=" * 40)
-        logger.info("Step 4: Excel 통합 리포트")
+        logger.info("Step 5: Excel 통합 리포트")
         logger.info("=" * 40)
         try:
             import subprocess
@@ -351,7 +354,7 @@ def cmd_target(args):
             ]
             if db_password:
                 excel_cmd.extend(['--db-password', db_password])
-            result = subprocess.run(excel_cmd, capture_output=True, text=True, timeout=120)
+            result = subprocess.run(excel_cmd, capture_output=True, text=True, timeout=120, encoding='utf-8', errors='replace')
             if result.returncode == 0:
                 for line in result.stdout.split('\n'):
                     if '[OK]' in line:
