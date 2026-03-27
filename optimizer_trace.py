@@ -1147,7 +1147,7 @@ class OptimizerTraceAnalyzer:
                     
                     html += """
         <table>
-            <tr><th>#</th><th>접근 방법</th><th>인덱스</th><th>비용</th><th>응답 시간</th><th>병렬도</th><th>비용 비율</th></tr>
+            <tr><th>#</th><th>접근 방법</th><th>인덱스</th><th>비용</th><th>Cost_io</th><th>Cost_cpu</th><th>ix_sel</th><th>응답 시간</th><th>병렬도</th><th>비용 비율</th></tr>
 """
                     for rank, method in enumerate(sorted_methods, 1):
                         row_class = 'best-row' if rank == 1 else ('worst-row' if rank == len(sorted_methods) and len(sorted_methods) > 1 else '')
@@ -1162,12 +1162,22 @@ class OptimizerTraceAnalyzer:
                         elif 'FullScan' in method['method']:
                             badge = ' <span class="badge badge-fts">Full</span>'
                         
+                        cost_io = method.get('cost_io')
+                        cost_cpu = method.get('cost_cpu')
+                        ix_sel = method.get('ix_sel')
+                        cost_io_str = f'{cost_io:,.6f}' if cost_io is not None else '-'
+                        cost_cpu_str = f'{cost_cpu:,}' if cost_cpu is not None else '-'
+                        ix_sel_str = f'{ix_sel:.6f}' if ix_sel is not None else '-'
+                        
                         html += f"""
             <tr class="{row_class}">
                 <td>{rank}</td>
                 <td>{method['method']}{badge}</td>
                 <td>{idx_name}</td>
                 <td class="cost-num">{method['cost']:,.2f}</td>
+                <td class="cost-num">{cost_io_str}</td>
+                <td class="cost-num">{cost_cpu_str}</td>
+                <td class="cost-num">{ix_sel_str}</td>
                 <td class="cost-num">{method['response_time']:,.2f}</td>
                 <td>{method['degree']}</td>
                 <td>{ratio_str}</td>
@@ -1290,6 +1300,62 @@ class OptimizerTraceAnalyzer:
                 html += "            </table>\n        </details>\n"
         
         html += "    </div>\n" if (altered or default) else ""
+        
+        # ── 쿼리 변환 ──
+        qt_list = parsed_data.get('query_transformations', [])
+        if qt_list:
+            # 중복 제거 및 유형별 그룹핑
+            qt_types = {}
+            for qt in qt_list:
+                t = qt.get('type', 'UNKNOWN')
+                if t not in qt_types:
+                    qt_types[t] = {'name': qt.get('name', t), 'entries': [], 'statuses': set()}
+                qt_types[t]['entries'].append(qt)
+                qt_types[t]['statuses'].add(qt.get('status', ''))
+            
+            html += f"""
+    <div class="section">
+        <h2>🔄 쿼리 변환 (Query Transformations) — {len(qt_types)}개 유형, {len(qt_list)}건</h2>
+        <table>
+            <tr><th>유형</th><th>변환명</th><th>건수</th><th>상태</th></tr>
+"""
+            for t, info in qt_types.items():
+                statuses = ', '.join(sorted(info['statuses']))
+                status_badge = ''
+                if 'applied' in info['statuses']:
+                    status_badge = '<span class="badge badge-best">applied</span> '
+                if 'bypassed' in info['statuses']:
+                    status_badge += '<span class="badge badge-fts">bypassed</span> '
+                if 'considered' in info['statuses']:
+                    status_badge += '<span class="badge badge-idx">considered</span>'
+                html += f"""
+            <tr>
+                <td><strong>{t}</strong></td>
+                <td>{info['name']}</td>
+                <td class="cost-num">{len(info['entries'])}</td>
+                <td>{status_badge}</td>
+            </tr>
+"""
+            html += "        </table>\n"
+            
+            # 상세 내용 접기
+            html += f"""
+        <details>
+            <summary>📂 변환 상세 ({len(qt_list)}건) — 클릭하여 펼치기</summary>
+            <table>
+                <tr><th>유형</th><th>상태</th><th>상세</th></tr>
+"""
+            for qt in qt_list:
+                detail = qt.get('detail', '')
+                if detail:
+                    html += f"""
+                <tr>
+                    <td>{qt.get('type', '')}</td>
+                    <td>{qt.get('status', '')}</td>
+                    <td style="font-size:12px">{detail[:200]}</td>
+                </tr>
+"""
+            html += "            </table>\n        </details>\n    </div>\n"
         
         # ── Footer ──
         html += f"""
