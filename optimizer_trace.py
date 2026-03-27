@@ -214,7 +214,7 @@ class OptimizerTraceCollector:
                 return None
             
             # 10053 내용 확인
-            check_10053 = f"grep -c 'SINGLE TABLE ACCESS PATH\|PARAMETERS USED BY THE OPTIMIZER' {remote_trace_path} 2>/dev/null"
+            check_10053 = f"grep -c 'SINGLE TABLE ACCESS PATH\\|PARAMETERS USED BY THE OPTIMIZER' {remote_trace_path} 2>/dev/null"
             count = self.ssh_client.run_remote_cmd(check_10053).strip()
             self.logger.info(f"  10053 키워드: {count}건")
             
@@ -326,6 +326,8 @@ class OptimizerTraceAnalyzer:
             'best_join_order': {},
             'join_permutations_tried': 0,
             'cost_analysis': {},
+            'dynamic_sampling': [],
+            'query_transformations': [],
             'issues': [],
             'is_single_table': False,
         }
@@ -355,7 +357,13 @@ class OptimizerTraceAnalyzer:
             
             # 6. 비용 분석
             self._analyze_costs(parsed_data)
-            
+
+            # 6.5 동적 샘플링 감지
+            self._extract_dynamic_sampling(content, parsed_data)
+
+            # 6.6 쿼리 변환 추출
+            self._extract_query_transformations(content, parsed_data)
+
             # 7. 이슈 감지
             self._detect_issues(parsed_data)
             
@@ -451,11 +459,11 @@ class OptimizerTraceAnalyzer:
     
     def _extract_base_statistics(self, content: str, parsed_data: Dict[str, Any]):
         """기본 통계 정보 추출 — 실제 10053 포맷에 맞춤"""
-        # Table Stats::
-        # Table: TB_FINANCIAL_STMT  Alias: TB_FINANCIAL_STMT  (Using composite stats)
-        #   #Rows: 3802835  SSZ: 0  LGR: 0  #Blks:  112876  AvgRowLen:  202.00  ...
+        # Table Stats — handle extra spaces in alias, optional (NOT ANALYZED), etc.
+        # Table: BLOG_POST  Alias:  P  (NOT ANALYZED)
+        #   #Rows: 82  SSZ: 0  LGR: 0  #Blks:  1  AvgRowLen:  100.00  NEB: 0  ...
         table_pattern = re.compile(
-            r'Table:\s+(\S+)\s+Alias:\s+(\S+).*?\n'
+            r'Table:\s+(\S+)\s+Alias:\s+(\S+)([^\n]*)\n'
             r'\s+#Rows:\s+(\d+).*?#Blks:\s+(\d+)\s+AvgRowLen:\s+([\d.]+)',
             re.DOTALL
         )
@@ -465,28 +473,36 @@ class OptimizerTraceAnalyzer:
             if table_name in seen_tables:
                 continue
             seen_tables.add(table_name)
+            rest_of_line = m.group(3)
+            not_analyzed = bool(re.search(r'NOT ANALYZED', rest_of_line, re.IGNORECASE))
             parsed_data['base_statistics'][table_name] = {
                 'alias': m.group(2),
-                'rows': int(m.group(3)),
-                'blocks': int(m.group(4)),
-                'avg_row_len': float(m.group(5))
+                'rows': int(m.group(4)),
+                'blocks': int(m.group(5)),
+                'avg_row_len': float(m.group(6)),
+                'not_analyzed': not_analyzed,
             }
 
-        # Index Stats::
-        # Index: IDX_FS_CORP_YEAR  Col#: 2 4 5
-        #   USING COMPOSITE STATS
-        # LVLS: 2  #LB: 19266  #DK: 18994  LB/K: 1.00  DB/K: 7.00  CLUF: 141132.00  NRW: 3802835.00
+        # Index Stats — handle (NOT ANALYZED), KKEISFLG, SSZ, extra fields after NRW
+        # Real formats:
+        #   Index: IDX_BLOG_POST_AUTHOR  Col#: 5
+        #   LVLS: 0  #LB: 0  #DK: 0  LB/K: 0.00  DB/K: 0.00  CLUF: 0.00  NRW: 0.00 SSZ: ...
+        #   Index: PK_BLOG_POST  Col#: 1    (NOT ANALYZED)
+        #   LVLS: 1  #LB: 25  ...
+        #   Index: SYS_IL0000165827C00003$$  Col#:    (NOT ANALYZED)
+        #   LVLS: 1  #LB: 25  ...
         index_pattern = re.compile(
-            r'Index:\s+(\S+)\s+Col#:\s+([\d\s]+)\n'
-            r'(?:.*?USING COMPOSITE STATS\n)?'
+            r'Index:\s+(\S+)\s+Col#:\s*([\d\s]*?)(?:\s*\(.*?\))?\s*\n'
             r'\s*LVLS:\s+(\d+)\s+#LB:\s+(\d+)\s+#DK:\s+(\d+)\s+LB/K:\s+([\d.]+)\s+DB/K:\s+([\d.]+)\s+CLUF:\s+([\d.]+)\s+NRW:\s+([\d.]+)',
-            re.DOTALL
         )
         indexes = {}
         for m in index_pattern.finditer(content):
             idx_name = m.group(1)
             if idx_name in indexes:
                 continue
+            # Check for NOT ANALYZED in the Col# line area
+            full_match = m.group(0)
+            not_analyzed = bool(re.search(r'NOT ANALYZED', full_match, re.IGNORECASE))
             indexes[idx_name] = {
                 'columns': m.group(2).strip(),
                 'levels': int(m.group(3)),
@@ -495,35 +511,38 @@ class OptimizerTraceAnalyzer:
                 'lb_per_key': float(m.group(6)),
                 'db_per_key': float(m.group(7)),
                 'clustering_factor': float(m.group(8)),
-                'num_rows': float(m.group(9))
+                'num_rows': float(m.group(9)),
+                'not_analyzed': not_analyzed,
             }
         parsed_data['index_statistics'] = indexes
 
-        # Column 통계 추출
-        # Column (#5): REPRT_CODE(VARCHAR2)
-        #   AvgLen: 6 NDV: 4 Nulls: 0 Density: 0.115587
-        #   Histogram: Freq  #Bkts: 4  UncompBkts: 3802835  EndPtVals: 4
+        # Column 통계 추출 — Histogram line is optional, handle NO STATISTICS marker
+        # Column (#11): STATUS(VARCHAR2)  NO STATISTICS (using defaults)
+        #   AvgLen: 12 NDV: 3 Nulls: 0 Density: 0.390244
         col_pattern = re.compile(
-            r'Column\s+\(#(\d+)\):\s+(\S+)\((\w+)\)\n'
-            r'\s+AvgLen:\s+(\d+)\s+NDV:\s+(\d+)\s+Nulls:\s+(\d+)\s+Density:\s+([\d.]+)\n'
-            r'\s+Histogram:\s+(\S+)\s+#Bkts:\s+(\d+)'
+            r'Column\s+\(#(\d+)\):\s+(\S+)\((\w+)\)([^\n]*)\n'
+            r'\s+AvgLen:\s+(\d+)\s+NDV:\s+(\d+)\s+Nulls:\s+(\d+)\s+Density:\s+([\d.]+)'
+            r'(?:\n\s+Histogram:\s+(\S+)\s+#Bkts:\s+(\d+)'
             r'(?:\s+UncompBkts:\s+(\d+))?'
-            r'(?:\s+EndPtVals:\s+(\d+))?',
+            r'(?:\s+EndPtVals:\s+(\d+))?)?',
         )
         columns = {}
         for m in col_pattern.finditer(content):
             col_name = m.group(2)
+            rest_of_line = m.group(4)
+            no_stats = bool(re.search(r'NO STATISTICS', rest_of_line, re.IGNORECASE))
             columns[col_name] = {
                 'col_num': int(m.group(1)),
                 'data_type': m.group(3),
-                'avg_len': int(m.group(4)),
-                'ndv': int(m.group(5)),
-                'nulls': int(m.group(6)),
-                'density': float(m.group(7)),
-                'histogram': m.group(8),
-                'buckets': int(m.group(9)),
-                'uncomp_buckets': int(m.group(10)) if m.group(10) else None,
-                'end_pt_vals': int(m.group(11)) if m.group(11) else None,
+                'avg_len': int(m.group(5)),
+                'ndv': int(m.group(6)),
+                'nulls': int(m.group(7)),
+                'density': float(m.group(8)),
+                'histogram': m.group(9) if m.group(9) else ('None' if not no_stats else 'N/A (no stats)'),
+                'buckets': int(m.group(10)) if m.group(10) else 0,
+                'uncomp_buckets': int(m.group(11)) if m.group(11) else None,
+                'end_pt_vals': int(m.group(12)) if m.group(12) else None,
+                'no_statistics': no_stats,
             }
         parsed_data['column_statistics'] = columns
 
@@ -563,47 +582,78 @@ class OptimizerTraceAnalyzer:
             lines = block_text.split('\n')
             current_method = None
             current_index = None
-            
+            current_resc_io = None
+            current_resc_cpu = None
+            current_ix_sel = None
+            current_ix_sel_filters = None
+
             for j, line in enumerate(lines):
                 # Access Path 라인 감지
                 ap_m = re.match(r'\s*Access Path:\s+(.+)', line)
                 if ap_m:
-                    current_method = ap_m.group(1).strip()
-                    current_index = None
+                    # New access path — if same method name as previous, merge info
+                    new_method = ap_m.group(1).strip()
+                    if new_method != current_method:
+                        # Reset for new method
+                        current_method = new_method
+                        current_index = None
+                        current_resc_io = None
+                        current_resc_cpu = None
+                        current_ix_sel = None
+                        current_ix_sel_filters = None
                     continue
-                
+
                 # Index 이름 감지 (Access Path 바로 다음에 나올 수 있음)
                 idx_m = re.match(r'\s*Index:\s+(\S+)', line)
                 if idx_m and current_method:
                     current_index = idx_m.group(1)
                     continue
-                
+
+                # resc_io / resc_cpu 라인 감지
+                resc_m = re.match(r'\s*resc_io:\s+([\d.]+)\s+resc_cpu:\s+(\d+)', line)
+                if resc_m and current_method:
+                    current_resc_io = float(resc_m.group(1))
+                    current_resc_cpu = int(resc_m.group(2))
+                    continue
+
+                # ix_sel 라인 감지
+                ixsel_m = re.match(r'\s*ix_sel:\s+([\d.]+)\s+ix_sel_with_filters:\s+([\d.]+)', line)
+                if ixsel_m and current_method:
+                    current_ix_sel = float(ixsel_m.group(1))
+                    current_ix_sel_filters = float(ixsel_m.group(2))
+                    continue
+
                 # Cost 라인 감지
                 cost_m = re.match(r'\s*Cost:\s+([\d.]+)\s+Resp:\s+([\d.]+)\s+Degree:\s+(\d+)', line)
                 if cost_m and current_method:
-                    path_info['access_methods'].append({
+                    entry = {
                         'method': current_method,
                         'index': current_index,
                         'cost': float(cost_m.group(1)),
                         'response_time': float(cost_m.group(2)),
                         'degree': int(cost_m.group(3)),
-                    })
+                        'cost_io': current_resc_io,
+                        'cost_cpu': current_resc_cpu,
+                        'ix_sel': current_ix_sel,
+                        'ix_sel_with_filters': current_ix_sel_filters,
+                    }
+                    path_info['access_methods'].append(entry)
                     current_method = None
                     current_index = None
+                    current_resc_io = None
+                    current_resc_cpu = None
+                    current_ix_sel = None
+                    current_ix_sel_filters = None
                     continue
-                    
-                # "Cost:" 가 Cost_io와 같은 줄에 있는 경우도 처리
-                cost_m2 = re.match(r'\s+Cost:\s+([\d.]+)\s+Resp:\s+([\d.]+)\s+Degree:\s+(\d+)', line)
-                if cost_m2 and current_method:
-                    path_info['access_methods'].append({
-                        'method': current_method,
-                        'index': current_index,
-                        'cost': float(cost_m2.group(1)),
-                        'response_time': float(cost_m2.group(2)),
-                        'degree': int(cost_m2.group(3)),
-                    })
-                    current_method = None
-                    current_index = None
+
+                # Cost_io / Cost_cpu breakdown (appears on the line after Cost)
+                costio_m = re.match(r'\s*Cost_io:\s+([\d.]+)\s+Cost_cpu:\s+(\d+)', line)
+                if costio_m and path_info['access_methods']:
+                    # Attach to the last added method
+                    last = path_info['access_methods'][-1]
+                    last['cost_io'] = float(costio_m.group(1))
+                    last['cost_cpu'] = int(costio_m.group(2))
+                    continue
             
             # Best Access Path 추출
             # Best:: AccessPath: IndexFFS
@@ -701,6 +751,73 @@ class OptimizerTraceAnalyzer:
         
         parsed_data['cost_analysis'] = cost_analysis
 
+    def _extract_dynamic_sampling(self, content: str, parsed_data: Dict[str, Any]):
+        """동적 샘플링 감지"""
+        # Pattern: "Dynamic sampling updated table card"  or "** Dynamic sampling used for table"
+        ds_pattern = re.compile(
+            r'(?:Dynamic sampling|dynamic sampling)\s+.*?(?:table|index)\s+.*',
+            re.IGNORECASE
+        )
+        entries = []
+        for m in ds_pattern.finditer(content):
+            line = m.group(0).strip()
+            if line not in entries:
+                entries.append(line)
+        parsed_data['dynamic_sampling'] = entries
+
+    def _extract_query_transformations(self, content: str, parsed_data: Dict[str, Any]):
+        """쿼리 변환 추출 — PM, CBQT, TE, SU, JE, CVM, etc."""
+        transformations = []
+
+        # Predicate Move-Around
+        pm_m = re.search(r'Predicate Move-Around \(PM\)', content)
+        if pm_m:
+            transformations.append({'type': 'PM', 'name': 'Predicate Move-Around', 'status': 'considered'})
+
+        # CBQT
+        cbqt_entries = re.findall(r'(CBQT[:\s]+.*)', content)
+        for entry in cbqt_entries:
+            status = 'applied' if 'Bypass' not in entry else 'bypassed'
+            transformations.append({'type': 'CBQT', 'name': 'Cost-Based Query Transformation', 'status': status, 'detail': entry.strip()})
+
+        # Table Expansion (TE)
+        te_entries = re.findall(r'(TE:\s+.*)', content)
+        for entry in te_entries:
+            transformations.append({'type': 'TE', 'name': 'Table Expansion', 'status': 'considered', 'detail': entry.strip()})
+
+        # Subquery Unnesting (SU)
+        su_entries = re.findall(r'(SU:\s+.*)', content)
+        for entry in su_entries:
+            status = 'applied' if 'unnested' in entry.lower() else 'considered'
+            transformations.append({'type': 'SU', 'name': 'Subquery Unnesting', 'status': status, 'detail': entry.strip()})
+
+        # Join Elimination (JE)
+        je_entries = re.findall(r'(JE:\s+.*)', content)
+        for entry in je_entries:
+            transformations.append({'type': 'JE', 'name': 'Join Elimination', 'status': 'considered', 'detail': entry.strip()})
+
+        # Complex View Merging (CVM)
+        cvm_entries = re.findall(r'(CVM:\s+.*)', content)
+        for entry in cvm_entries:
+            transformations.append({'type': 'CVM', 'name': 'Complex View Merging', 'status': 'considered', 'detail': entry.strip()})
+
+        # Star Transformation (ST)
+        st_entries = re.findall(r'(ST:\s+.*)', content)
+        for entry in st_entries:
+            transformations.append({'type': 'ST', 'name': 'Star Transformation', 'status': 'considered', 'detail': entry.strip()})
+
+        # Or Expansion (ORE)
+        ore_entries = re.findall(r'(ORE:\s+.*)', content)
+        for entry in ore_entries:
+            transformations.append({'type': 'ORE', 'name': 'Or Expansion', 'status': 'considered', 'detail': entry.strip()})
+
+        # Generic: query transformation patterns
+        generic_pattern = re.compile(r'query block .+ (#\d+)\s*transformed', re.IGNORECASE)
+        for m in generic_pattern.finditer(content):
+            transformations.append({'type': 'GENERIC', 'name': 'Query Block Transformation', 'status': 'applied', 'detail': m.group(0).strip()})
+
+        parsed_data['query_transformations'] = transformations
+
     def _detect_issues(self, parsed_data: Dict[str, Any]):
         """이슈 감지 — 실무 관점. 반환: list of dict"""
         issues = []
@@ -769,7 +886,35 @@ class OptimizerTraceAnalyzer:
                 'message': f"MBRC 값 미설정 (기본값 {mbrc.get('default', '?')} 사용) — Full Scan 비용 계산에 영향",
                 'recommendation': 'db_file_multiblock_read_count 또는 시스템 통계 수집으로 실제 MBRC를 반영하세요.'
             })
-        
+
+        # 6. NOT ANALYZED 테이블/인덱스 감지
+        not_analyzed_tables = [t for t, info in parsed_data.get('base_statistics', {}).items() if info.get('not_analyzed')]
+        not_analyzed_indexes = [i for i, info in parsed_data.get('index_statistics', {}).items() if info.get('not_analyzed')]
+        if not_analyzed_tables:
+            issues.append({
+                'severity': 'WARNING',
+                'type': 'Table NOT ANALYZED',
+                'message': f"통계 미수집 테이블: {', '.join(not_analyzed_tables)}",
+                'recommendation': 'DBMS_STATS.GATHER_TABLE_STATS로 테이블 통계를 수집하세요. 통계 미수집 시 옵티마이저가 부정확한 실행계획을 생성할 수 있습니다.'
+            })
+        if not_analyzed_indexes:
+            issues.append({
+                'severity': 'WARNING',
+                'type': 'Index NOT ANALYZED',
+                'message': f"통계 미수집 인덱스: {', '.join(not_analyzed_indexes)}",
+                'recommendation': 'DBMS_STATS.GATHER_INDEX_STATS 또는 GATHER_TABLE_STATS(cascade=>TRUE)로 인덱스 통계를 수집하세요.'
+            })
+
+        # 7. 동적 샘플링 사용 감지
+        ds_entries = parsed_data.get('dynamic_sampling', [])
+        if ds_entries:
+            issues.append({
+                'severity': 'INFO',
+                'type': 'Dynamic Sampling Used',
+                'message': f"동적 샘플링 사용 ({len(ds_entries)}건): 옵티마이저가 런타임에 통계를 추정하고 있음",
+                'recommendation': 'DBMS_STATS로 정확한 통계를 수집하면 동적 샘플링 없이도 안정적인 실행계획을 얻을 수 있습니다.'
+            })
+
         parsed_data['issues'] = issues
 
     def generate_10053_report(self, parsed_data: Dict[str, Any], output_path: str) -> str:
