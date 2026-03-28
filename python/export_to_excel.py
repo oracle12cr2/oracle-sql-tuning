@@ -1486,8 +1486,8 @@ def write_10053_access_paths(ws, data_list):
 
     headers = ["SQL_ID", "테이블", "접근 방법", "인덱스", "비용(Cost)",
                "응답시간(Resp)", "병렬도", "Cost_io", "Cost_cpu", "ix_sel",
-               "최적 여부", "비용 비율"]
-    widths  = [18, 22, 25, 22, 16, 16, 10, 14, 14, 12, 12, 12]
+               "Scan IO Cost", "Total Scan IO", "최적 여부", "비용 비율"]
+    widths  = [18, 22, 25, 22, 16, 16, 10, 14, 14, 12, 16, 16, 12, 12]
     for i, (h, w) in enumerate(zip(headers, widths), 1):
         hcell(ws, 1, i, h, w)
     ws.row_dimensions[1].height = 22
@@ -1521,8 +1521,12 @@ def write_10053_access_paths(ws, data_list):
                 scell(ws, row, 8, f"{cost_io:,.6f}" if cost_io is not None else "-", align="right", fill=row_fill)
                 scell(ws, row, 9, f"{cost_cpu:,}" if cost_cpu is not None else "-", align="right", fill=row_fill)
                 scell(ws, row, 10, f"{ix_sel:.6f}" if ix_sel is not None else "-", align="right", fill=row_fill)
-                scell(ws, row, 11, "✅ 최적" if is_best else "", align="center", fill=row_fill)
-                scell(ws, row, 12, f"{ratio:.1f}x" if not is_best else "1.0x", align="center", fill=row_fill)
+                scan_io = path.get("scan_io_cost")
+                total_sio = path.get("total_scan_io_cost")
+                scell(ws, row, 11, f"{scan_io:,.2f}" if scan_io is not None else "-", align="right", fill=row_fill)
+                scell(ws, row, 12, f"{total_sio:,.2f}" if total_sio is not None else "-", align="right", fill=row_fill)
+                scell(ws, row, 13, "✅ 최적" if is_best else "", align="center", fill=row_fill)
+                scell(ws, row, 14, f"{ratio:.1f}x" if not is_best else "1.0x", align="center", fill=row_fill)
                 ws.row_dimensions[row].height = 16
                 row += 1
 

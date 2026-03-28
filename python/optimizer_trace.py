@@ -561,11 +561,15 @@ class OptimizerTraceAnalyzer:
                 'table_name': table_name,
                 'cardinality': None,
                 'access_methods': [],
-                'best_access': None
+                'best_access': None,
+                'scan_io_cost': None,
+                'scan_cpu_cost': None,
+                'total_scan_io_cost': None,
+                'total_scan_cpu_cost': None,
             }
             
             # Cardinality 추출
-            card_m = re.search(r'Card: Original:\s+([\d.]+)\s+Rounded:\s+(\d+)', block_text)
+            card_m = re.search(r'Card: Original:\s+([\d.]+)(?:rsel\s*=\s*[\d.eE+-]+\s+)?\s*Rounded:\s+(\d+)', block_text)
             if card_m:
                 path_info['cardinality'] = int(card_m.group(2))
             
@@ -617,10 +621,52 @@ class OptimizerTraceAnalyzer:
                     continue
 
                 # ix_sel 라인 감지
-                ixsel_m = re.match(r'\s*ix_sel:\s+([\d.]+)\s+ix_sel_with_filters:\s+([\d.]+)', line)
+                ixsel_m = re.match(r'\s*ix_sel:\s+([\d.eE+-]+)\s+ix_sel_with_filters:\s+([\d.eE+-]+)', line)
                 if ixsel_m and current_method:
                     current_ix_sel = float(ixsel_m.group(1))
                     current_ix_sel_filters = float(ixsel_m.group(2))
+                    continue
+
+                # Scan IO Cost (Disk)
+                scan_io_m = re.match(r'\s*Scan IO\s+Cost\s+\(Disk\)\s*=\s+([\d.]+)', line)
+                if scan_io_m:
+                    path_info['scan_io_cost'] = float(scan_io_m.group(1))
+                    continue
+
+                # Scan CPU Cost (Disk)
+                scan_cpu_m = re.match(r'\s*Scan CPU Cost\s+\(Disk\)\s*=\s+([\d.]+)', line)
+                if scan_cpu_m:
+                    path_info['scan_cpu_cost'] = float(scan_cpu_m.group(1))
+                    continue
+
+                # Total Scan IO Cost
+                total_sio_m = re.match(r'\s*Total Scan IO\s+Cost\s*=\s+([\d.]+)', line)
+                if total_sio_m:
+                    path_info['total_scan_io_cost'] = float(total_sio_m.group(1))
+                    continue
+
+                # Total Scan CPU Cost
+                total_scpu_m = re.match(r'\s*Total Scan CPU\s+Cost\s*=\s+([\d.]+)', line)
+                if total_scpu_m:
+                    path_info['total_scan_cpu_cost'] = float(total_scpu_m.group(1))
+                    continue
+
+                # NL Join Cost 라인 감지
+                nljoin_m = re.match(r'\s*NL Join\s*:\s*Cost:\s+([\d.]+)\s+Resp:\s+([\d.]+)\s+Degree:\s+(\d+)', line)
+                if nljoin_m and current_method:
+                    entry = {
+                        'method': current_method,
+                        'index': current_index,
+                        'cost': float(nljoin_m.group(1)),
+                        'response_time': float(nljoin_m.group(2)),
+                        'degree': int(nljoin_m.group(3)),
+                        'cost_io': current_resc_io,
+                        'cost_cpu': current_resc_cpu,
+                        'ix_sel': current_ix_sel,
+                        'ix_sel_with_filters': current_ix_sel_filters,
+                        'join_type': 'NL',
+                    }
+                    path_info['access_methods'].append(entry)
                     continue
 
                 # Cost 라인 감지
@@ -1140,7 +1186,21 @@ class OptimizerTraceAnalyzer:
                 card = path_info.get('cardinality')
                 card_str = f" (Cardinality: {card:,})" if card else ""
                 html += f"        <h3>📋 {path_info['table_name']}{card_str}</h3>\n"
-                
+
+                # Scan IO Cost 요약
+                scan_io = path_info.get('scan_io_cost')
+                total_sio = path_info.get('total_scan_io_cost')
+                total_scpu = path_info.get('total_scan_cpu_cost')
+                if scan_io is not None or total_sio is not None or total_scpu is not None:
+                    parts = []
+                    if scan_io is not None:
+                        parts.append(f"Scan IO Cost: {scan_io:,.2f}")
+                    if total_sio is not None:
+                        parts.append(f"Total Scan IO: {total_sio:,.2f}")
+                    if total_scpu is not None:
+                        parts.append(f"Total Scan CPU: {total_scpu:,.2f}")
+                    html += f"        <p>📊 {' | '.join(parts)}</p>\n"
+
                 if path_info['access_methods']:
                     sorted_methods = sorted(path_info['access_methods'], key=lambda x: x.get('cost', float('inf')))
                     best_cost = sorted_methods[0]['cost'] if sorted_methods else 0
